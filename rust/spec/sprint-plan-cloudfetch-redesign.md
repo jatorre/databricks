@@ -147,20 +147,43 @@ struct ChunkHandle {
 
 ---
 
-### PECO-2929 — Implement Download Workers
+### PECO-2929 — Implement Download Workers ✅
 
-**Scope:** `rust/src/reader/cloudfetch/` (replaces `download_chunk_with_retry`)
+**Status:** Complete
+
+**Scope:** `rust/src/reader/cloudfetch/chunk_downloader.rs` (replaces `download_chunk_with_retry`)
 
 **Changes:**
-- Spawn `config.num_download_workers` long-lived `tokio::spawn` tasks
+- Added `ChunkDownload` trait to abstract the download operation for testability
+- `ChunkDownloader` implements `ChunkDownload` via `#[async_trait]`
+- `spawn_download_workers()` spawns `config.num_download_workers` long-lived `tokio::spawn` tasks
+- Workers share the download channel receiver via `Arc<Mutex<mpsc::UnboundedReceiver<ChunkDownloadTask>>>`
 - Each worker loops over `download_channel`:
-  1. **Proactive expiry check** using `url_expiration_buffer_secs` buffer — if link is expired or expiring soon, call `refetch_link()` before first HTTP request
-  2. `GET presigned_url`
-  3. On success: parse Arrow IPC → `result_tx.send(Ok(batches))`
-  4. On 401/403/404: call `refetch_link()`, retry immediately (no sleep), count against `max_refresh_retries`
-  5. On other errors: `sleep(retry_delay * (attempt + 1))` (linear backoff), retry, count against `max_retries`
-  6. On `max_retries` exceeded: `result_tx.send(Err(...))`
+  1. **Proactive expiry check** using `url_expiration_buffer_secs` buffer — if link is expired or expiring soon, calls `refetch_link()` before first HTTP request
+  2. Downloads via `ChunkDownload.download()`
+  3. On success: returns `Ok(batches)` via `result_tx.send()`
+  4. On 401/403/404: calls `refetch_link()`, retries immediately (no sleep), counts against both `max_retries` and `max_refresh_retries`
+  5. On other errors: `sleep(retry_delay * (attempt + 1))` (linear backoff), retries, counts against `max_retries` only
+  6. On `max_retries` or `max_refresh_retries` exceeded: sends `Err(...)` via `result_tx`
 - All sleeps use `tokio::select!` on `cancel_token.cancelled()` for cancellation
+- Auth error detection via `is_auth_error()` inspects error message for "HTTP 401", "HTTP 403", "HTTP 404" patterns
+- Exported `spawn_download_workers` and `ChunkDownload` from `mod.rs`
+
+**Implementation notes:**
+- `download_chunk()` is a standalone async function (not a method) for clean testability
+- Worker loop holds the `Mutex<UnboundedReceiver>` lock only briefly during `recv()`, not during processing
+- Proactive expiry check counts against `max_refresh_retries` only (not `max_retries`), matching C# parity
+- `refetch_link()` failure during retry is treated as a terminal error (no further retries)
+
+**Tests implemented (all 8 passing):**
+- `worker_retries_on_transient_error` — mock downloader fails 2 times then succeeds
+- `worker_uses_linear_backoff` — measures elapsed time to verify linear backoff (100ms * 1 + 100ms * 2 = 300ms)
+- `worker_refetches_url_on_401_403_404` — tests each of 401, 403, 404 triggers refetch_link
+- `worker_no_sleep_on_auth_error` — uses 60s retry_delay, verifies completes in <500ms (no sleep)
+- `worker_gives_up_after_max_refresh_retries` — verifies terminal error with `max_refresh_retries=2`
+- `worker_proactively_refreshes_expiring_url` — link expires in 10s with 60s buffer, verifies refetch before download
+- `spawn_workers_process_tasks_and_exit` — end-to-end test with 2 workers processing 3 tasks
+- `test_chunk_downloader_creation` — existing test preserved
 
 **Retry contract:**
 

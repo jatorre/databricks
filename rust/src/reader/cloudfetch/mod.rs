@@ -28,7 +28,7 @@ pub mod scheduler;
 pub mod streaming_provider;
 
 pub use arrow_parser::parse_arrow_ipc;
-pub use chunk_downloader::ChunkDownloader;
+pub use chunk_downloader::{spawn_download_workers, ChunkDownload, ChunkDownloader};
 pub use link_fetcher::{ChunkLinkFetcher, SeaChunkLinkFetcher};
 pub use pipeline_types::{ChunkDownloadTask, ChunkHandle};
 pub use scheduler::{spawn_scheduler, SchedulerChannels};

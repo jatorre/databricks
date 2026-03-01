@@ -195,26 +195,46 @@ struct ChunkHandle {
 
 ---
 
-### PECO-2930 — Implement Consumer (`next_batch`)
+### PECO-2930 — Implement Consumer (`next_batch`) ✅
+
+**Status:** Complete
 
 **Scope:** `rust/src/reader/cloudfetch/streaming_provider.rs`
 
 **Changes:**
-- Replace `wait_for_chunk` + Notify poll loop with:
+- Replaced `wait_for_chunk` + Notify poll loop with channel-based pattern:
   ```rust
-  let handle = result_rx.recv().await?;  // get next ChunkHandle in order
-  let batches = handle.result_rx.await?;  // await the oneshot directly
+  let handle = rx.recv().await;     // get next ChunkHandle in order
+  let batches = handle.result_rx.await;  // await the oneshot directly
   ```
-- `Ok(None)` when `result_rx` returns `None` (channel closed = end of stream)
-- Consumer selects on `cancel_token.cancelled()` when awaiting `result_rx`
+- `Ok(None)` returned when `result_rx` returns `None` (channel closed = end of stream)
+- Consumer selects on `cancel_token.cancelled()` when awaiting both `result_rx.recv()` and `handle.result_rx`
+- Empty chunks handled via recursive `Box::pin(self.next_batch()).await`
+
+**Implementation notes:**
+- `result_rx` uses `tokio::sync::Mutex` (not `std::sync::Mutex`) because the guard is held across the `tokio::select!` await point
+- `batch_buffer` uses `std::sync::Mutex` since it is only held briefly and never across await points
+- `get_schema()` reads the first batch to extract the schema, then pushes it back into `batch_buffer` so it isn't lost
+- Constructor signature simplified: `new(config, link_fetcher, downloader)` — no `runtime_handle` parameter, returns `Self` not `Arc<Self>`
+
+**Tests implemented (all 7 passing):**
+- `test_chunk_link_fetch_result_end_of_stream` — verify ChunkLinkFetchResult end-of-stream helper
+- `test_next_batch_returns_batches_in_order` — 3 chunks consumed sequentially
+- `test_next_batch_returns_none_at_end_of_stream` — Ok(None) after last chunk
+- `test_get_schema_from_first_batch` — schema extracted and batch preserved
+- `test_cancel_stops_pipeline` — cancel prevents further consumption
+- `test_drop_cancels_token` — Drop impl triggers cancellation
+- `test_empty_result_set` — zero chunks returns Ok(None) immediately
 
 ---
 
-### PECO-2931 — Refactor `StreamingCloudFetchProvider` struct
+### PECO-2931 — Refactor `StreamingCloudFetchProvider` struct ✅
 
-**Scope:** `rust/src/reader/cloudfetch/streaming_provider.rs`
+**Status:** Complete
 
-**Remove these fields:**
+**Scope:** `rust/src/reader/cloudfetch/streaming_provider.rs`, `rust/src/reader/mod.rs`
+
+**Removed fields:**
 
 | Field | Replaced by |
 |---|---|
@@ -225,16 +245,29 @@ struct ChunkHandle {
 | `next_download_index: AtomicI64` | Sequential counter owned by scheduler task |
 | `current_chunk_index: AtomicI64` | Implicit in sequential `result_rx.recv()` calls |
 | `end_of_stream: AtomicBool` | Implicit when `result_rx` returns `None` |
+| `link_fetcher: Arc<dyn ChunkLinkFetcher>` | Passed to scheduler/workers during construction |
+| `chunk_downloader: Arc<ChunkDownloader>` | Passed to workers during construction |
+| `config: CloudFetchConfig` | Used during construction only |
+| `runtime_handle: tokio::runtime::Handle` | No longer needed (pipeline is self-contained) |
+
+**Also removed:**
+- `ChunkState` and `ChunkEntry` local stubs (no longer needed)
+- `initialize()`, `fetch_and_store_links()`, `schedule_downloads()`, `download_chunk_with_retry()`, `wait_for_chunk()` — all replaced by pipeline
 
 **New struct:**
 ```rust
 pub struct StreamingCloudFetchProvider {
-    result_rx: Mutex<mpsc::Receiver<ChunkHandle>>,
+    result_rx: TokioMutex<tokio::sync::mpsc::Receiver<ChunkHandle>>,
     schema: OnceLock<SchemaRef>,
     batch_buffer: Mutex<VecDeque<RecordBatch>>,
     cancel_token: CancellationToken,
 }
 ```
+
+**`reader/mod.rs` changes:**
+- `create_cloudfetch_reader()` updated to call `StreamingCloudFetchProvider::new(config, link_fetcher, chunk_downloader)` (3 parameters)
+- `ChunkDownloader` wrapped as `Arc<dyn ChunkDownload>` (uses trait object)
+- Provider wrapped in `Arc::new(provider)` for `CloudFetchResultReader`
 
 ---
 

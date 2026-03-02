@@ -77,9 +77,11 @@ struct ChunkHandle {
 
 ## Sub-Tasks
 
-### PECO-2927 — Update `CloudFetchConfig` and remove legacy types
+### PECO-2927 — Update `CloudFetchConfig` and remove legacy types ✅ COMPLETED
 
 **Scope:** `rust/src/types/cloudfetch.rs`
+
+**Status:** Completed. All changes implemented and tests passing.
 
 **Changes:**
 - Add 3 new fields to `CloudFetchConfig`:
@@ -89,9 +91,14 @@ struct ChunkHandle {
 - Remove `chunk_ready_timeout: Option<Duration>`
 - Correct defaults: `max_retries` 5→3, `retry_delay` 1500ms→500ms
 - Remove `LINK_EXPIRY_BUFFER_SECS` constant (replaced by `url_expiration_buffer_secs`)
-- Remove `ChunkEntry` and `ChunkState` types entirely
-- Update `CloudFetchLink::is_expired()` to accept a buffer parameter (in seconds) instead of using the hardcoded constant
+- Remove `ChunkEntry` and `ChunkState` types from public API (legacy copies kept as private types within `streaming_provider.rs` until it is rewritten)
+- Update `CloudFetchLink::is_expired()` to accept a `buffer_secs: u32` parameter instead of using the hardcoded constant
 - Update all tests in this file
+- Update `database.rs` option setters: removed `chunk_ready_timeout_ms`, added `max_refresh_retries`, `num_download_workers`, `url_expiration_buffer_secs`
+
+**Implementation decisions:**
+- `ChunkEntry`/`ChunkState` were not fully deleted from the codebase—they were moved to be private types within `streaming_provider.rs` since that module still uses the DashMap-based architecture. They will be fully removed when `streaming_provider.rs` is rewritten in a later task.
+- `DEFAULT_CHUNK_READY_TIMEOUT_SECS` was replaced by a module-local `DEFAULT_CHUNK_WAIT_TIMEOUT_SECS` constant in `streaming_provider.rs` (30s) to preserve the existing timeout behavior until the rewrite.
 
 ---
 
@@ -99,7 +106,7 @@ struct ChunkHandle {
 
 **Scope:** New types + new scheduler task in `rust/src/reader/cloudfetch/`
 
-**Changes (Types):**
+**Changes (Types):** ✅ COMPLETED (as part of Task 1)
 - Add `ChunkDownloadTask` struct with `chunk_index`, `link`, `result_tx` (oneshot sender)
 - Add `ChunkHandle` struct with `chunk_index`, `result_rx` (oneshot receiver)
 - Add `create_chunk_pair()` helper function for creating connected task/handle pairs

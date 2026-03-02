@@ -695,7 +695,7 @@ namespace AdbcDrivers.Databricks.StatementExecution
 
         // Metadata command routing
 
-        private string? EffectiveCatalog => MetadataUtilities.NormalizeSparkCatalog(_metadataCatalogName) ?? _catalog;
+        private string? EffectiveCatalog => _connection.ResolveEffectiveCatalog(_metadataCatalogName);
 
         /// <summary>
         /// Escapes wildcard characters (_ and %) in metadata name parameters when
@@ -729,6 +729,16 @@ namespace AdbcDrivers.Databricks.StatementExecution
             return await this.TraceActivityAsync(async activity =>
             {
                 activity?.SetTag("catalog_pattern", _metadataCatalogName ?? "(none)");
+                activity?.SetTag("enable_multiple_catalog_support", _connection.EnableMultipleCatalogSupport);
+
+                // When multiple catalog support is disabled, return a single "SPARK" catalog
+                if (!_connection.EnableMultipleCatalogSupport)
+                {
+                    var catalogSchema = MetadataSchemaFactory.CreateCatalogsSchema();
+                    var sparkBuilder = new StringArray.Builder();
+                    sparkBuilder.Append("SPARK");
+                    return new QueryResult(1, new HiveInfoArrowStream(catalogSchema, new IArrowArray[] { sparkBuilder.Build() }));
+                }
 
                 string sql = new ShowCatalogsCommand(EscapePatternWildcardsInName(_metadataCatalogName)).Build();
                 activity?.SetTag("sql_query", sql);
@@ -762,6 +772,12 @@ namespace AdbcDrivers.Databricks.StatementExecution
             {
                 activity?.SetTag("catalog", EffectiveCatalog ?? "(none)");
                 activity?.SetTag("schema_pattern", _metadataSchemaName ?? "(none)");
+                activity?.SetTag("enable_multiple_catalog_support", _connection.EnableMultipleCatalogSupport);
+
+                // When flag=false and user specified an explicit non-SPARK catalog, return empty
+                if (!_connection.EnableMultipleCatalogSupport
+                    && MetadataUtilities.NormalizeSparkCatalog(_metadataCatalogName) != null)
+                    return MetadataSchemaFactory.CreateEmptySchemasResult();
 
                 string sql = new ShowSchemasCommand(
                     EffectiveCatalog,
@@ -805,6 +821,11 @@ namespace AdbcDrivers.Databricks.StatementExecution
                 activity?.SetTag("catalog", EffectiveCatalog ?? "(none)");
                 activity?.SetTag("schema_pattern", _metadataSchemaName ?? "(none)");
                 activity?.SetTag("table_pattern", _metadataTableName ?? "(none)");
+                activity?.SetTag("enable_multiple_catalog_support", _connection.EnableMultipleCatalogSupport);
+
+                if (!_connection.EnableMultipleCatalogSupport
+                    && MetadataUtilities.NormalizeSparkCatalog(_metadataCatalogName) != null)
+                    return MetadataSchemaFactory.CreateEmptyTablesResult();
 
                 string sql = new ShowTablesCommand(
                     EffectiveCatalog,
@@ -876,6 +897,12 @@ namespace AdbcDrivers.Databricks.StatementExecution
                 activity?.SetTag("schema_pattern", _metadataSchemaName ?? "(none)");
                 activity?.SetTag("table_pattern", _metadataTableName ?? "(none)");
                 activity?.SetTag("column_pattern", _metadataColumnName ?? "(none)");
+                activity?.SetTag("enable_multiple_catalog_support", _connection.EnableMultipleCatalogSupport);
+
+                if (!_connection.EnableMultipleCatalogSupport
+                    && MetadataUtilities.NormalizeSparkCatalog(_metadataCatalogName) != null)
+                    return FlatColumnsResultBuilder.BuildFlatColumnsResult(
+                        System.Array.Empty<(string, string, string, TableInfo)>());
 
                 string sql = new ShowColumnsCommand(
                     EffectiveCatalog,

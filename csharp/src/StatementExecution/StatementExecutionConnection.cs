@@ -60,6 +60,7 @@ namespace AdbcDrivers.Databricks.StatementExecution
         private readonly int _waitTimeoutSeconds;
         private readonly int _pollingIntervalMs;
         private readonly bool _enablePKFK;
+        private readonly bool _enableMultipleCatalogSupport;
 
         // Memory pooling (shared across connection)
         private readonly Microsoft.IO.RecyclableMemoryStreamManager _recyclableMemoryStreamManager;
@@ -197,6 +198,7 @@ namespace AdbcDrivers.Databricks.StatementExecution
             _waitTimeoutSeconds = PropertyHelper.GetIntPropertyWithValidation(properties, DatabricksParameters.WaitTimeout, 10);
             _pollingIntervalMs = PropertyHelper.GetPositiveIntPropertyWithValidation(properties, DatabricksParameters.PollingInterval, 1000);
             _enablePKFK = PropertyHelper.GetBooleanPropertyWithValidation(properties, DatabricksParameters.EnablePKFK, true);
+            _enableMultipleCatalogSupport = PropertyHelper.GetBooleanPropertyWithValidation(properties, DatabricksParameters.EnableMultipleCatalogSupport, true);
 
             // Memory pooling
             _recyclableMemoryStreamManager = memoryStreamManager ?? new Microsoft.IO.RecyclableMemoryStreamManager();
@@ -682,6 +684,48 @@ namespace AdbcDrivers.Databricks.StatementExecution
         }
 
         internal bool EnablePKFK => _enablePKFK;
+
+        internal bool EnableMultipleCatalogSupport => _enableMultipleCatalogSupport;
+
+        /// <summary>
+        /// Resolves the effective catalog for metadata queries.
+        /// When EnableMultipleCatalogSupport is true: uses the provided catalog,
+        ///   falling back to the connection default catalog if null.
+        /// When EnableMultipleCatalogSupport is false: queries the server with
+        ///   SELECT CURRENT_CATALOG() since SEA requires an explicit catalog
+        ///   (unlike Thrift which treats null as default).
+        /// </summary>
+        internal string? ResolveEffectiveCatalog(string? requestedCatalog)
+        {
+            string? normalized = MetadataUtilities.NormalizeSparkCatalog(requestedCatalog);
+
+            if (_enableMultipleCatalogSupport)
+            {
+                return normalized ?? _catalog;
+            }
+
+            // flag=false: if user specified an explicit non-null catalog, it won't
+            // match the default — the statement layer should return empty.
+            // If null/SPARK, resolve via server query.
+            return normalized ?? GetCurrentCatalog();
+        }
+
+        /// <summary>
+        /// Queries the server for the current catalog via SELECT CURRENT_CATALOG().
+        /// </summary>
+        private string? GetCurrentCatalog()
+        {
+            var batches = ExecuteMetadataSql("SELECT CURRENT_CATALOG()");
+            foreach (var batch in batches)
+            {
+                if (batch.Length > 0 && batch.Column(0) is StringArray col && !col.IsNull(0))
+                {
+                    return col.GetString(0);
+                }
+            }
+
+            return _catalog;
+        }
 
         internal CancellationTokenSource CreateMetadataTimeoutCts()
         {

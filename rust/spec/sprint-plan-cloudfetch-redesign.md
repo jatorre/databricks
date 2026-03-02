@@ -287,13 +287,26 @@ pub struct StreamingCloudFetchProvider {
 
 ---
 
-### PECO-2933 — Integration Tests (3 tests)
+### PECO-2933 — Integration Tests (3 tests) ✅
+
+**Status:** Complete
 
 | Test | What it verifies |
 |---|---|
 | `end_to_end_sequential_consumption` | All chunks downloaded and read in order |
 | `end_to_end_cancellation_mid_stream` | Cancel during active download — no deadlock or panic |
 | `end_to_end_401_recovery` | Presigned URL expires mid-stream; driver refetches and continues |
+
+**Implementation notes:**
+- All 3 integration tests added to `streaming_provider.rs` test module alongside the existing unit tests
+- Each test uses specialized mock infrastructure (not reused from unit tests) for precise behavioral verification:
+  - `PerChunkMockDownloader`: Returns distinct data per chunk (chunk_index × 100 + batch_num) with configurable batches_per_chunk, enabling sequential ordering verification
+  - `SlowMockDownloader`: Introduces configurable delay per download, ensuring cancellation test exercises mid-flight pipeline state
+  - `Auth401MockDownloader`: Tracks per-URL attempts; returns HTTP 401 on first attempt for selected chunks, succeeds on retry with refreshed URL
+  - `RefreshableMockLinkFetcher`: Returns fresh URLs with "-refreshed" suffix on refetch_link, enabling Auth401MockDownloader to distinguish original vs refreshed attempts
+- `end_to_end_sequential_consumption`: 8 chunks × 2 batches/chunk = 16 batches verified in exact order
+- `end_to_end_cancellation_mid_stream`: 50 chunks with 100ms delay, cancels after 3 batches, verifies completion within 5s timeout (no deadlock, no panic)
+- `end_to_end_401_recovery`: 6 chunks with chunks 1, 3, 5 failing with 401 on first attempt; all 6 eventually consumed with correct data
 
 ---
 
@@ -338,8 +351,8 @@ pub struct StreamingCloudFetchProvider {
 
 - [x] `cargo build` passes with no warnings
 - [x] `cargo clippy -- -D warnings` passes
-- [ ] All 9 unit tests pass
-- [ ] All 3 integration tests pass
+- [x] All 9 unit tests pass
+- [x] All 3 integration tests pass
 - [x] `cargo fmt` applied
 - [x] `DashMap` dependency removed from `streaming_provider.rs`
 - [x] `ChunkEntry`, `ChunkState` types deleted

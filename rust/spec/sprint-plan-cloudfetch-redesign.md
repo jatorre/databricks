@@ -102,7 +102,7 @@ struct ChunkHandle {
 
 ---
 
-### PECO-2928 — Implement `ChunkDownloadTask`, `ChunkHandle`, and Scheduler
+### PECO-2928 — Implement `ChunkDownloadTask`, `ChunkHandle`, and Scheduler ✅ COMPLETED
 
 **Scope:** New types + new scheduler task in `rust/src/reader/cloudfetch/`
 
@@ -139,7 +139,7 @@ struct ChunkHandle {
 
 ---
 
-### PECO-2929 — Implement Download Workers
+### PECO-2929 — Implement Download Workers ✅ COMPLETED
 
 **Scope:** `rust/src/reader/cloudfetch/` (replaces `download_chunk_with_retry`)
 
@@ -164,7 +164,7 @@ struct ChunkHandle {
 
 ---
 
-### PECO-2930 — Implement Consumer (`next_batch`)
+### PECO-2930 — Implement Consumer (`next_batch`) ✅ COMPLETED
 
 **Scope:** `rust/src/reader/cloudfetch/streaming_provider.rs`
 
@@ -179,7 +179,7 @@ struct ChunkHandle {
 
 ---
 
-### PECO-2931 — Refactor `StreamingCloudFetchProvider` struct
+### PECO-2931 — Refactor `StreamingCloudFetchProvider` struct ✅ COMPLETED
 
 **Scope:** `rust/src/reader/cloudfetch/streaming_provider.rs`
 
@@ -207,7 +207,7 @@ pub struct StreamingCloudFetchProvider {
 
 ---
 
-### PECO-2932 — Unit Tests (9 tests)
+### PECO-2932 — Unit Tests (14 tests) ✅ COMPLETED
 
 | Test | What it verifies |
 |---|---|
@@ -223,7 +223,7 @@ pub struct StreamingCloudFetchProvider {
 
 ---
 
-### PECO-2933 — Integration Tests (3 tests)
+### PECO-2933 — Integration Tests (3 tests) ✅ COMPLETED
 
 | Test | What it verifies |
 |---|---|
@@ -272,11 +272,27 @@ pub struct StreamingCloudFetchProvider {
 
 ## Definition of Done
 
-- [ ] `cargo build` passes with no warnings
-- [ ] `cargo clippy -- -D warnings` passes
-- [ ] All 9 unit tests pass
-- [ ] All 3 integration tests pass
-- [ ] `cargo fmt` applied
+- [x] `cargo build` passes with no warnings
+- [x] `cargo clippy -- -D warnings` passes (including `--all-targets`)
+- [x] All 14 unit tests pass (8 scheduler + 6 worker)
+- [x] All 3 integration tests pass (end-to-end with wiremock)
+- [x] `cargo fmt` applied
+
+### Implementation Notes (Task 2)
+
+**Key design decisions made during implementation:**
+
+1. **`result_rx` uses `tokio::sync::Mutex`** instead of `std::sync::Mutex` — `clippy::await_holding_lock` correctly flags that holding a `std::sync::Mutex` guard across `.await` is problematic. Since `mpsc::Receiver::recv()` requires `&mut self` and is `async`, the tokio Mutex is the natural fit. The spec's mention of `Mutex` is satisfied; the only difference is the tokio variant.
+
+2. **`ChunkDownloader` exposes `download_with_status()`** — Returns a new `DownloadError` enum (`AuthError` / `TransientError`) so workers can distinguish 401/403/404 from network errors. The inner reqwest client is used directly (bypassing `DatabricksHttpClient::execute_without_auth`'s retry logic) so workers own the full retry contract.
+
+3. **Workers share `download_rx` via `Arc<tokio::sync::Mutex>`** — The unbounded channel receiver is wrapped in an async mutex so all N workers can pull tasks concurrently. This is the standard fan-out pattern in tokio.
+
+4. **`_runtime_handle` parameter retained** — The `StreamingCloudFetchProvider::new()` constructor still accepts a `tokio::runtime::Handle` for API compatibility with `ResultReaderFactory`, but background tasks are spawned via `tokio::spawn` on the current runtime rather than using `runtime_handle.spawn()`.
+
+5. **Linear backoff**: `retry_delay * attempts` where `attempts` is incremented before sleeping, making it equivalent to `retry_delay * (attempt + 1)` as specified.
+
+6. **14 unit tests (not 9)** — The spec listed 9 core tests; 5 additional tests were added for completeness (scheduler_exits_when_has_more_false, scheduler_cancellation, scheduler_handle_before_task, scheduler_multiple_batches, scheduler_empty_batch).
 - [ ] `DashMap` dependency removed from `streaming_provider.rs`
 - [ ] `ChunkEntry`, `ChunkState` types deleted
 - [ ] `chunk_ready_timeout` config field removed

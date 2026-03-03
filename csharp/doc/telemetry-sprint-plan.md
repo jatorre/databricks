@@ -192,7 +192,16 @@ Implement the core telemetry infrastructure including feature flag management, p
 #### WI-2.1: FeatureFlagCache
 **Description**: Singleton that caches feature flags per host with reference counting.
 
-**Location**: `csharp/src/Telemetry/FeatureFlagCache.cs`
+**Status**: ✅ **COMPLETED**
+
+**Location**: `csharp/src/FeatureFlagCache.cs`, `csharp/src/FeatureFlagContext.cs`
+
+**Implementation Notes**:
+- Implemented using IMemoryCache with TTL-based expiration
+- FeatureFlagContext handles background refresh and flag storage
+- Thread-safe using SemaphoreSlim for async locking
+- Comprehensive test coverage in `test/Unit/FeatureFlagCacheTests.cs`
+- E2E tests in `test/E2E/FeatureFlagCacheE2ETest.cs`
 
 **Input**:
 - Host string
@@ -409,10 +418,21 @@ Implement the core telemetry infrastructure including feature flag management, p
 #### WI-5.2: DatabricksTelemetryExporter
 **Description**: Exports metrics to Databricks telemetry service via HTTP POST.
 
+**Status**: ✅ **COMPLETED**
+
 **Location**: `csharp/src/Telemetry/DatabricksTelemetryExporter.cs`
 
+**Implementation Notes**:
+- Implements ITelemetryExporter interface
+- Uses Polly for retry logic with configurable attempts
+- Supports both authenticated (/telemetry-ext) and unauthenticated (/telemetry-unauth) endpoints
+- Never throws exceptions (all swallowed and traced)
+- Creates TelemetryRequest wrapper with uploadTime and protoLogs
+- Comprehensive test coverage in `test/Unit/Telemetry/DatabricksTelemetryExporterTests.cs`
+- E2E tests in `test/E2E/Telemetry/ClientTelemetryE2ETests.cs`
+
 **Input**:
-- List of TelemetryMetric
+- List of TelemetryFrontendLog
 - HttpClient
 - TelemetryConfiguration
 
@@ -727,8 +747,34 @@ csharp/test/
 
 ---
 
+## Sprint Status Summary (Updated 2026-03-03)
+
+### Completed Work Items
+- ✅ WI-1.1: TelemetryConfiguration
+- ✅ WI-1.2: Tag Definition System
+- ✅ WI-1.3: Telemetry Data Models
+- ✅ WI-2.1: FeatureFlagCache
+- ✅ WI-3.1: CircuitBreaker
+- ✅ WI-4.1: ExceptionClassifier
+- ✅ WI-5.2: DatabricksTelemetryExporter
+
+### Remaining Work Items
+See [sprint-plan-telemetry-completion-2026-03-03.md](./sprint-plan-telemetry-completion-2026-03-03.md) for the continuation sprint plan covering:
+- WI-2.2: TelemetryClientManager
+- WI-3.2: CircuitBreakerManager
+- WI-3.3: CircuitBreakerTelemetryExporter
+- WI-5.3: MetricsAggregator
+- WI-5.4: DatabricksActivityListener
+- WI-5.5: TelemetryClient
+- WI-6.1: DatabricksConnection Integration
+- WI-6.2: Activity Tag Enhancement
+- WI-7.1: E2E Tests
+
+---
+
 ## References
 
 - [telemetry-design.md](./telemetry-design.md) - Detailed design document
+- [sprint-plan-telemetry-completion-2026-03-03.md](./sprint-plan-telemetry-completion-2026-03-03.md) - Continuation sprint plan
 - [JDBC TelemetryClient.java](https://github.com/databricks/databricks-jdbc) - Reference implementation
 - [.NET Activity API](https://learn.microsoft.com/en-us/dotnet/core/diagnostics/distributed-tracing)

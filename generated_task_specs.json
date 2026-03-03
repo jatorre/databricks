@@ -1,0 +1,638 @@
+[
+  {
+    "id": "task-2.1-circuit-breaker-manager",
+    "title": "Implement CircuitBreakerManager singleton for per-host circuit breakers",
+    "description": "Create the CircuitBreakerManager singleton that manages one CircuitBreaker instance per host. Uses ConcurrentDictionary<string, CircuitBreaker> for thread-safe per-host breaker management. Provides GetCircuitBreaker(host) method that returns existing or creates new circuit breaker. Include comprehensive unit tests following existing xUnit patterns (no mocking framework, manual test doubles).",
+    "pr_group": "pr-circuit-breaker",
+    "pr_group_order": 1,
+    "design_context": "Section 3.3 of telemetry-design.md: CircuitBreakerManager is a singleton that manages circuit breakers per host. Uses ConcurrentDictionary for thread safety. GetCircuitBreaker(host) creates or returns existing breaker. Sprint plan Task 2: CircuitBreakerManager depends on CircuitBreaker (already complete).",
+    "dependencies": [],
+    "input_requirements": [
+      "CircuitBreaker class exists at src/Telemetry/CircuitBreaker.cs (Polly-based, internal sealed class with ExecuteAsync, State, Reset)",
+      "CircuitBreakerState enum exists in CircuitBreaker.cs (Closed, Open, HalfOpen)",
+      "TelemetryConfiguration exists with CircuitBreakerThreshold and CircuitBreakerTimeout properties"
+    ],
+    "output_deliverables": [
+      "src/Telemetry/CircuitBreakerManager.cs - Singleton manager with GetCircuitBreaker(host)",
+      "test/Unit/Telemetry/CircuitBreakerManagerTests.cs - Comprehensive unit tests"
+    ],
+    "exit_criteria": [
+      "CircuitBreakerManager is internal sealed class with singleton GetInstance() pattern",
+      "GetCircuitBreaker(host) returns same instance for same host",
+      "GetCircuitBreaker(host) returns different instances for different hosts",
+      "Thread-safe for concurrent access from multiple connections",
+      "Unit tests: GetCircuitBreaker_NewHost_CreatesBreaker, GetCircuitBreaker_SameHost_ReturnsSameBreaker, GetCircuitBreaker_DifferentHosts_CreatesSeparateBreakers",
+      "All unit tests pass (dotnet test --filter 'FullyQualifiedName~CircuitBreakerManager')",
+      "Full solution builds successfully (dotnet build)"
+    ],
+    "files_to_modify": [],
+    "files_to_create": [
+      "csharp/src/Telemetry/CircuitBreakerManager.cs",
+      "csharp/test/Unit/Telemetry/CircuitBreakerManagerTests.cs"
+    ],
+    "test_requirements": [
+      "GetCircuitBreaker_NewHost_CreatesBreaker: new host returns non-null CircuitBreaker",
+      "GetCircuitBreaker_SameHost_ReturnsSameBreaker: same host twice returns same reference",
+      "GetCircuitBreaker_DifferentHosts_CreatesSeparateBreakers: 'host1' and 'host2' return different instances",
+      "GetCircuitBreaker_ThreadSafe_NoDuplicates: 10 concurrent threads requesting same host get same instance",
+      "Follow xUnit [Fact] pattern with Arrange/Act/Assert, same naming convention as CircuitBreakerTests.cs"
+    ],
+    "allowed_tools": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash"
+    ],
+    "max_turns": 100,
+    "estimated_complexity": "low"
+  },
+  {
+    "id": "task-3.1-circuit-breaker-telemetry-exporter",
+    "title": "Implement CircuitBreakerTelemetryExporter wrapping ITelemetryExporter with circuit breaker",
+    "description": "Create CircuitBreakerTelemetryExporter that implements ITelemetryExporter and wraps an inner exporter with circuit breaker protection. When circuit is closed, delegates to inner exporter. When circuit is open, drops events gracefully (returns false, no exception). Circuit breaker tracks failures from inner exporter. Uses CircuitBreakerManager to get per-host circuit breaker. All exceptions swallowed internally per telemetry design requirement. Include comprehensive unit tests.",
+    "pr_group": "pr-circuit-breaker",
+    "pr_group_order": 2,
+    "design_context": "Section 3.3 and Section 8.1 of telemetry-design.md: CircuitBreakerTelemetryExporter implements ITelemetryExporter. Wraps inner exporter with circuit breaker. Drops events when circuit open. Catches BrokenCircuitException and returns false. Circuit breaker MUST see exceptions before they are swallowed. Sprint plan Task 3.",
+    "dependencies": [
+      "task-2.1-circuit-breaker-manager"
+    ],
+    "input_requirements": [
+      "CircuitBreakerManager singleton exists with GetCircuitBreaker(host)",
+      "CircuitBreaker class with ExecuteAsync, State property",
+      "ITelemetryExporter interface with ExportAsync(IReadOnlyList<TelemetryFrontendLog>, CancellationToken) returning Task<bool>",
+      "TelemetryFrontendLog model exists in src/Telemetry/Models/"
+    ],
+    "output_deliverables": [
+      "src/Telemetry/CircuitBreakerTelemetryExporter.cs - ITelemetryExporter wrapper with circuit breaker",
+      "test/Unit/Telemetry/CircuitBreakerTelemetryExporterTests.cs - Comprehensive unit tests"
+    ],
+    "exit_criteria": [
+      "CircuitBreakerTelemetryExporter implements ITelemetryExporter (public interface)",
+      "Constructor takes (string host, ITelemetryExporter innerExporter)",
+      "Gets circuit breaker from CircuitBreakerManager.GetInstance().GetCircuitBreaker(host)",
+      "When circuit closed: delegates to innerExporter.ExportAsync(), returns its result",
+      "When circuit open: returns false, no exception thrown to caller",
+      "Circuit breaker tracks inner exporter failures (sees exceptions before swallowing)",
+      "All exceptions caught internally, logged at TRACE level via Debug.WriteLine",
+      "Unit tests pass, solution builds"
+    ],
+    "files_to_modify": [],
+    "files_to_create": [
+      "csharp/src/Telemetry/CircuitBreakerTelemetryExporter.cs",
+      "csharp/test/Unit/Telemetry/CircuitBreakerTelemetryExporterTests.cs"
+    ],
+    "test_requirements": [
+      "CircuitClosed_ExportsMetrics: circuit closed, inner exporter called, returns true",
+      "CircuitOpen_DropsMetrics: circuit open, no export, returns false, no exception",
+      "InnerExporterFails_CircuitBreakerTracksFailure: inner exporter throws, circuit breaker failure count incremented",
+      "InnerExporterReturnsTrue_ReturnsTrue: success passthrough",
+      "InnerExporterReturnsFalse_ReturnsFalse: failure passthrough",
+      "NullLogs_HandledGracefully: null/empty input doesn't crash",
+      "Use manual mock implementing ITelemetryExporter (no mocking framework), follow existing test patterns"
+    ],
+    "allowed_tools": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash"
+    ],
+    "max_turns": 100,
+    "estimated_complexity": "medium"
+  },
+  {
+    "id": "task-4.1-telemetry-client-interface-and-implementation",
+    "title": "Implement ITelemetryClient interface, TelemetryClient, and TelemetryClientHolder",
+    "description": "Create ITelemetryClient interface with Enqueue, FlushAsync, CloseAsync methods. Implement TelemetryClient using ConcurrentQueue for batching, periodic Timer flush (default 5s), batch size threshold flush, SemaphoreSlim for flush serialization, graceful shutdown. Create TelemetryClientHolder class for reference counting. All exceptions swallowed internally. Include comprehensive unit tests.",
+    "pr_group": "pr-telemetry-client",
+    "pr_group_order": 1,
+    "design_context": "Section 3.2 of telemetry-design.md: ITelemetryClient is internal interface extending IAsyncDisposable. TelemetryClient uses ConcurrentQueue, Timer for periodic flush, SemaphoreSlim for preventing concurrent flushes. Enqueue is non-blocking thread-safe. FlushAsync drains queue up to batch size. CloseAsync stops timer, cancels pending operations, does final flush. TelemetryClientHolder holds client and int _refCount starting at 1.",
+    "dependencies": [],
+    "input_requirements": [
+      "ITelemetryExporter interface exists with ExportAsync method",
+      "TelemetryConfiguration exists with BatchSize (100) and FlushIntervalMs (5000)",
+      "TelemetryFrontendLog model exists"
+    ],
+    "output_deliverables": [
+      "src/Telemetry/ITelemetryClient.cs - Interface with Enqueue, FlushAsync, CloseAsync",
+      "src/Telemetry/TelemetryClient.cs - Full batching implementation with timer",
+      "src/Telemetry/TelemetryClientHolder.cs - Holder with reference count",
+      "test/Unit/Telemetry/TelemetryClientTests.cs - Comprehensive unit tests"
+    ],
+    "exit_criteria": [
+      "ITelemetryClient is internal interface extending IAsyncDisposable with void Enqueue(TelemetryFrontendLog), Task FlushAsync(CancellationToken), Task CloseAsync()",
+      "TelemetryClient constructor takes (ITelemetryExporter, TelemetryConfiguration)",
+      "Enqueue is non-blocking, adds to ConcurrentQueue, triggers flush if batch size reached",
+      "FlushAsync uses SemaphoreSlim(1,1) to prevent concurrent flushes, drains queue up to batch size",
+      "CloseAsync: sets _disposed, disposes timer, cancels CTS, does final flush, disposes resources",
+      "Timer calls FlushAsync periodically at FlushIntervalMs",
+      "All exceptions swallowed (caught, Debug.WriteLine at TRACE)",
+      "TelemetryClientHolder has internal int _refCount=1 and ITelemetryClient Client property",
+      "All unit tests pass, solution builds"
+    ],
+    "files_to_modify": [],
+    "files_to_create": [
+      "csharp/src/Telemetry/ITelemetryClient.cs",
+      "csharp/src/Telemetry/TelemetryClient.cs",
+      "csharp/src/Telemetry/TelemetryClientHolder.cs",
+      "csharp/test/Unit/Telemetry/TelemetryClientTests.cs"
+    ],
+    "test_requirements": [
+      "Enqueue_AddsToQueue_NonBlocking: enqueue returns immediately, event in queue",
+      "Enqueue_BatchSizeReached_TriggersFlush: enqueue 100 events (batch size), ExportAsync called",
+      "FlushTimer_Elapses_ExportsEvents: wait for flush interval, ExportAsync called",
+      "CloseAsync_FlushesRemainingEvents: events in queue then close, all events exported",
+      "Exception_Swallowed_NoThrow: exporter throws, no exception propagated",
+      "Enqueue_AfterDispose_NoOp: enqueue after CloseAsync does nothing",
+      "FlushAsync_EmptyQueue_NoExport: flush with no events doesn't call exporter",
+      "ConcurrentFlush_OnlyOneProceeds: two concurrent FlushAsync calls, only one export",
+      "Use manual mock ITelemetryExporter (captures ExportAsync calls)"
+    ],
+    "allowed_tools": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash"
+    ],
+    "max_turns": 100,
+    "estimated_complexity": "medium"
+  },
+  {
+    "id": "task-1.1-telemetry-client-manager",
+    "title": "Implement TelemetryClientManager singleton with per-host client management",
+    "description": "Create TelemetryClientManager singleton that manages one TelemetryClient per host with reference counting. Uses ConcurrentDictionary<string, TelemetryClientHolder>. GetOrCreateClient(host, exporterFactory, config) creates new client or increments ref count. ReleaseClientAsync(host) decrements ref count, closes and removes when zero. Include test injection support (UseTestInstance, Reset). Include comprehensive unit tests.",
+    "pr_group": "pr-telemetry-client",
+    "pr_group_order": 2,
+    "design_context": "Section 3.2 of telemetry-design.md: TelemetryClientManager is singleton. GetOrCreateClient uses AddOrUpdate on ConcurrentDictionary - factory creates new TelemetryClientHolder with new TelemetryClient, update increments _refCount. ReleaseClientAsync decrements _refCount, if 0 removes from dict and calls CloseAsync. Also supports UseTestInstance() for test isolation and Reset() for cleanup. Sprint plan Task 1.",
+    "dependencies": [
+      "task-4.1-telemetry-client-interface-and-implementation"
+    ],
+    "input_requirements": [
+      "ITelemetryClient interface with Enqueue, FlushAsync, CloseAsync",
+      "TelemetryClient implementation",
+      "TelemetryClientHolder with _refCount and Client property",
+      "ITelemetryExporter interface",
+      "TelemetryConfiguration"
+    ],
+    "output_deliverables": [
+      "src/Telemetry/TelemetryClientManager.cs - Singleton manager with ref counting",
+      "test/Unit/Telemetry/TelemetryClientManagerTests.cs - Comprehensive unit tests"
+    ],
+    "exit_criteria": [
+      "TelemetryClientManager is internal sealed class with static GetInstance()",
+      "GetOrCreateClient(host, Func<ITelemetryExporter> exporterFactory, TelemetryConfiguration config) returns ITelemetryClient",
+      "Same host returns same client, increments ref count",
+      "ReleaseClientAsync(host) decrements ref count, closes+removes client when count reaches 0",
+      "Thread-safe for concurrent access",
+      "UseTestInstance() for test injection, Reset() for cleanup",
+      "All unit tests pass, solution builds"
+    ],
+    "files_to_modify": [],
+    "files_to_create": [
+      "csharp/src/Telemetry/TelemetryClientManager.cs",
+      "csharp/test/Unit/Telemetry/TelemetryClientManagerTests.cs"
+    ],
+    "test_requirements": [
+      "GetOrCreateClient_NewHost_CreatesClient: new host returns non-null client with RefCount=1",
+      "GetOrCreateClient_ExistingHost_ReturnsSameClient: same host twice returns same client, RefCount=2",
+      "ReleaseClientAsync_LastReference_ClosesClient: single ref then release, client CloseAsync called, removed from cache",
+      "ReleaseClientAsync_MultipleReferences_KeepsClient: two refs, release one, RefCount=1, client still active",
+      "GetOrCreateClient_ThreadSafe_NoDuplicates: 10 concurrent threads same host, single client created",
+      "ReleaseClientAsync_UnknownHost_NoOp: release non-existent host doesn't throw",
+      "UseTestInstance_ReplacesAndRestores: test instance replaces singleton, IDisposable restores original",
+      "Use manual mock ITelemetryClient and ITelemetryExporter"
+    ],
+    "allowed_tools": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash"
+    ],
+    "max_turns": 100,
+    "estimated_complexity": "medium"
+  },
+  {
+    "id": "task-5.1-statement-telemetry-context",
+    "title": "Implement StatementTelemetryContext for multi-activity data aggregation",
+    "description": "Create StatementTelemetryContext class that holds aggregated telemetry data for a single statement. Implements MergeFrom(Activity) method that merges activity tags/events based on OperationName. Handles connection-level tags (session.id, auth.type, system config, connection params), statement-level tags (statement.id, statement.type, result.format), CloudFetch chunk details (from download_summary events), polling metrics, error info, and result latency. Builds OssSqlDriverTelemetryLog proto message. Include comprehensive unit tests.",
+    "pr_group": "pr-metrics-pipeline",
+    "pr_group_order": 1,
+    "design_context": "Section 2.3, 3.5, 4.4.2-4.4.12 of telemetry-design.md: StatementTelemetryContext merges data from multiple activities. MergeFrom switches on OperationName: ExecuteQuery/ExecuteUpdate \u2192 statement metrics; DownloadFiles \u2192 chunk details; PollOperationStatus \u2192 polling metrics. Also captures DriverSystemConfiguration (driver.version, runtime.*, os.*), DriverConnectionParameters (connection.*, feature.*), and DriverErrorInfo. BuildProto creates OssSqlDriverTelemetryLog with all nested messages.",
+    "dependencies": [],
+    "input_requirements": [
+      "Proto generated classes exist (OssSqlDriverTelemetryLog, DriverSystemConfiguration, DriverConnectionParameters, SqlExecutionEvent, ChunkDetails, ResultLatency, OperationDetail, DriverErrorInfo)",
+      "TelemetryFrontendLog model exists with FrontendLogEventId and WorkspaceId",
+      "System.Diagnostics.Activity API available"
+    ],
+    "output_deliverables": [
+      "src/Telemetry/StatementTelemetryContext.cs - Data aggregation context with MergeFrom and BuildProto",
+      "test/Unit/Telemetry/StatementTelemetryContextTests.cs - Comprehensive unit tests"
+    ],
+    "exit_criteria": [
+      "StatementTelemetryContext is internal sealed class",
+      "Constructor takes optional (string? sessionId, DriverSystemConfiguration? systemConfig, DriverConnectionParameters? connectionParams)",
+      "MergeFrom(Activity) merges tags based on OperationName (ExecuteQuery, ExecuteUpdate, DownloadFiles, PollOperationStatus, GetCatalogs, etc.)",
+      "Captures session.id, statement.id, auth.type, statement.type, result.format, result.compression_enabled",
+      "Processes cloudfetch.download_summary ActivityEvent for chunk details",
+      "Captures poll.count, poll.latency_ms for operation detail",
+      "Captures error.type and activity status for error info",
+      "BuildProto() returns complete OssSqlDriverTelemetryLog proto",
+      "All unit tests pass, solution builds"
+    ],
+    "files_to_modify": [],
+    "files_to_create": [
+      "csharp/src/Telemetry/StatementTelemetryContext.cs",
+      "csharp/test/Unit/Telemetry/StatementTelemetryContextTests.cs"
+    ],
+    "test_requirements": [
+      "MergeFrom_ExecuteQuery_CapturesLatencyAndType: root activity sets OperationLatencyMs and StatementType",
+      "MergeFrom_DownloadFiles_CapturesChunkDetails: CloudFetch event tags extracted to ChunkDetails",
+      "MergeFrom_PollStatus_CapturesPollingMetrics: poll.count and poll.latency_ms captured",
+      "MergeFrom_MultipleActivities_AggregatesCorrectly: 3 activities for same statement merge into one context",
+      "MergeFrom_ErrorActivity_CapturesErrorInfo: error.type and status description captured",
+      "MergeFrom_ConnectionActivity_CapturesSystemConfig: driver.version, os.*, runtime.* captured",
+      "BuildProto_ReturnsCompleteMessage: all fields populated in OssSqlDriverTelemetryLog",
+      "BuildProto_MissingFields_DefaultToEmptyOrZero: missing tags result in empty strings and 0 values",
+      "Use real Activity objects created from ActivitySource in tests"
+    ],
+    "allowed_tools": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash"
+    ],
+    "max_turns": 100,
+    "estimated_complexity": "high"
+  },
+  {
+    "id": "task-5.2-metrics-aggregator",
+    "title": "Implement MetricsAggregator for per-connection activity-to-proto aggregation",
+    "description": "Create MetricsAggregator class that receives ProcessActivity callbacks, aggregates activities by statement_id into StatementTelemetryContext, detects root activity completion to emit proto via ITelemetryClient.Enqueue(). Uses ConcurrentDictionary<string, StatementTelemetryContext> keyed by statement_id. Handles connection open events (emit immediately), statement events (aggregate until root completes), and error events. Implements FlushAsync for connection close. Filters tags using TelemetryTagRegistry. All exceptions swallowed. Include comprehensive unit tests.",
+    "pr_group": "pr-metrics-pipeline",
+    "pr_group_order": 2,
+    "design_context": "Section 3.5 of telemetry-design.md: MetricsAggregator is per-connection. ProcessActivity extracts statement.id, gets/creates StatementTelemetryContext, calls MergeFrom. IsRootActivity checks parent == null or parent from different ActivitySource. When root completes, builds TelemetryFrontendLog from proto and calls _telemetryClient.Enqueue(). Connection.Open activities emit immediately. FlushAsync on connection close emits all pending contexts. Sprint plan Task 5.",
+    "dependencies": [
+      "task-5.1-statement-telemetry-context",
+      "task-4.1-telemetry-client-interface-and-implementation"
+    ],
+    "input_requirements": [
+      "StatementTelemetryContext with MergeFrom(Activity) and BuildProto()",
+      "ITelemetryClient interface with Enqueue(TelemetryFrontendLog)",
+      "TelemetryConfiguration",
+      "TelemetryTagRegistry for tag filtering",
+      "ExceptionClassifier for terminal vs retryable exceptions",
+      "TelemetryFrontendLog model"
+    ],
+    "output_deliverables": [
+      "src/Telemetry/MetricsAggregator.cs - Per-connection aggregator with ProcessActivity and FlushAsync",
+      "test/Unit/Telemetry/MetricsAggregatorTests.cs - Comprehensive unit tests"
+    ],
+    "exit_criteria": [
+      "MetricsAggregator is internal sealed class implementing IDisposable",
+      "Constructor takes (ITelemetryClient, TelemetryConfiguration) plus optional session/system config params",
+      "ProcessActivity(Activity) routes to correct StatementTelemetryContext by statement.id",
+      "Root activity completion (no parent or parent from different source) triggers proto emission via Enqueue",
+      "Connection.Open activities emit immediately without statement_id aggregation",
+      "FlushAsync emits all pending statement contexts (for connection close)",
+      "IsRootActivity correctly identifies root vs child activities",
+      "All exceptions swallowed (try-catch with Debug.WriteLine at TRACE)",
+      "All unit tests pass, solution builds"
+    ],
+    "files_to_modify": [],
+    "files_to_create": [
+      "csharp/src/Telemetry/MetricsAggregator.cs",
+      "csharp/test/Unit/Telemetry/MetricsAggregatorTests.cs"
+    ],
+    "test_requirements": [
+      "ProcessActivity_Statement_AggregatesByStatementId: multiple activities with same statement_id go to same context",
+      "ProcessActivity_RootActivityComplete_EmitsProto: root activity stops, telemetryClient.Enqueue called",
+      "ProcessActivity_ChildActivity_DoesNotEmit: child activity stops, no Enqueue until root stops",
+      "ProcessActivity_ConnectionOpen_EmitsImmediately: Connection.Open activity triggers immediate emission",
+      "ProcessActivity_NoStatementId_Skipped: activity without statement.id is ignored",
+      "FlushAsync_EmitsPendingContexts: pending contexts emitted on flush",
+      "ProcessActivity_ExceptionSwallowed: aggregator error doesn't propagate",
+      "ProcessActivity_MultipleStatements_SeparateContexts: different statement_ids tracked separately",
+      "Use manual mock ITelemetryClient, real Activity objects from ActivitySource"
+    ],
+    "allowed_tools": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash"
+    ],
+    "max_turns": 100,
+    "estimated_complexity": "high"
+  },
+  {
+    "id": "task-6.1-databricks-activity-listener",
+    "title": "Implement DatabricksActivityListener as global singleton routing activities to aggregators",
+    "description": "Create DatabricksActivityListener as a global singleton that wraps .NET ActivityListener to subscribe to 'Databricks.Adbc.Driver' ActivitySource. Routes ActivityStopped callbacks to the appropriate MetricsAggregator based on session.id tag. Supports RegisterAggregator/UnregisterAggregatorAsync for connection lifecycle. Sampling controlled by whether any aggregators are registered. All exceptions swallowed in callbacks. Include comprehensive unit tests.",
+    "pr_group": "pr-metrics-pipeline",
+    "pr_group_order": 3,
+    "design_context": "Section 3.4 of telemetry-design.md: DatabricksActivityListener is a global singleton (Lazy<T>). Wraps ActivityListener subscribing to 'Databricks.Adbc.Driver'. Routes ActivityStopped to MetricsAggregator by session.id. RegisterAggregator(sessionId, aggregator) on connection open. UnregisterAggregatorAsync(sessionId) on connection close (flushes aggregator). Start() creates and registers the ActivityListener. Sampling returns AllDataAndRecorded when aggregators exist. Sprint plan Task 6.",
+    "dependencies": [
+      "task-5.2-metrics-aggregator"
+    ],
+    "input_requirements": [
+      "MetricsAggregator with ProcessActivity(Activity) and FlushAsync()",
+      "TelemetryConfiguration with Enabled property",
+      "System.Diagnostics.ActivityListener API"
+    ],
+    "output_deliverables": [
+      "src/Telemetry/DatabricksActivityListener.cs - Global singleton ActivityListener",
+      "test/Unit/Telemetry/DatabricksActivityListenerTests.cs - Comprehensive unit tests"
+    ],
+    "exit_criteria": [
+      "DatabricksActivityListener is internal sealed class implementing IDisposable",
+      "Singleton via static Lazy<DatabricksActivityListener> or similar pattern",
+      "RegisterAggregator(string sessionId, MetricsAggregator aggregator) adds to ConcurrentDictionary",
+      "UnregisterAggregatorAsync(string sessionId) removes aggregator, calls FlushAsync on it",
+      "Start() creates ActivityListener with ShouldListenTo = 'Databricks.Adbc.Driver'",
+      "ActivityStopped callback extracts session.id, routes to correct aggregator",
+      "Sample returns AllDataAndRecorded when aggregators registered, None otherwise",
+      "All exceptions swallowed in OnActivityStopped (try-catch with Debug.WriteLine)",
+      "All unit tests pass, solution builds"
+    ],
+    "files_to_modify": [],
+    "files_to_create": [
+      "csharp/src/Telemetry/DatabricksActivityListener.cs",
+      "csharp/test/Unit/Telemetry/DatabricksActivityListenerTests.cs"
+    ],
+    "test_requirements": [
+      "Start_ListensToDatabricksActivitySource: ShouldListenTo returns true for 'Databricks.Adbc.Driver'",
+      "ActivityStopped_RoutesToCorrectAggregator: activity with session.id routes to registered aggregator",
+      "ActivityStopped_NoSessionId_Ignored: activity without session.id tag is silently dropped",
+      "ActivityStopped_UnknownSessionId_Ignored: activity with unregistered session.id is silently dropped",
+      "ActivityStopped_ExceptionSwallowed: aggregator throws, no exception propagated",
+      "RegisterAggregator_AddsToRegistry: registered aggregator receives activities",
+      "UnregisterAggregatorAsync_FlushesAndRemoves: unregister flushes aggregator and removes from registry",
+      "Sample_NoAggregators_ReturnsNone: no registered aggregators, sampling returns None",
+      "Sample_WithAggregators_ReturnsAllData: registered aggregators, sampling returns AllDataAndRecorded"
+    ],
+    "allowed_tools": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash"
+    ],
+    "max_turns": 100,
+    "estimated_complexity": "medium"
+  },
+  {
+    "id": "task-7.1-connection-integration",
+    "title": "Integrate telemetry pipeline into DatabricksConnection lifecycle",
+    "description": "Modify DatabricksConnection to initialize and manage the telemetry pipeline. In OpenAsync: parse TelemetryConfiguration, check feature flag, create TelemetryClient via TelemetryClientManager, create per-connection MetricsAggregator, register with DatabricksActivityListener. In Dispose: unregister aggregator, flush, release client via TelemetryClientManager. Add TestExporterFactory for test injection. Wire CreateTelemetryExporter to create CircuitBreakerTelemetryExporter wrapping DatabricksTelemetryExporter.",
+    "pr_group": "pr-connection-integration",
+    "pr_group_order": 1,
+    "design_context": "Section 3.2 (Usage in DatabricksConnection), Section 9 (Graceful Shutdown) of telemetry-design.md: OpenAsync checks _telemetryConfig.Enabled && IsTelemetryFeatureFlagEnabled(), then gets shared client from TelemetryClientManager, creates MetricsAggregator, creates DatabricksActivityListener, calls Start(). DisposeAsync stops listener, flushes aggregator, releases client. TestExporterFactory allows test injection. Sprint plan Task 7.",
+    "dependencies": [
+      "task-1.1-telemetry-client-manager",
+      "task-6.1-databricks-activity-listener",
+      "task-3.1-circuit-breaker-telemetry-exporter"
+    ],
+    "input_requirements": [
+      "TelemetryClientManager singleton with GetOrCreateClient/ReleaseClientAsync",
+      "DatabricksActivityListener singleton with RegisterAggregator/UnregisterAggregatorAsync",
+      "MetricsAggregator with ProcessActivity and FlushAsync",
+      "CircuitBreakerTelemetryExporter wrapping DatabricksTelemetryExporter",
+      "TelemetryConfiguration.FromProperties()",
+      "FeatureFlagCache (already complete) for feature flag checks",
+      "DatabricksConnection.cs existing lifecycle (OpenAsync, Dispose)"
+    ],
+    "output_deliverables": [
+      "Modified src/DatabricksConnection.cs with telemetry integration",
+      "test/Unit/Telemetry/DatabricksConnectionTelemetryTests.cs - Integration tests"
+    ],
+    "exit_criteria": [
+      "DatabricksConnection has private fields: ITelemetryClient?, MetricsAggregator?, _telemetryConfig",
+      "OpenAsync: parses TelemetryConfiguration from Properties, checks feature flag, initializes telemetry pipeline",
+      "CreateTelemetryExporter: creates DatabricksTelemetryExporter wrapped in CircuitBreakerTelemetryExporter",
+      "TestExporterFactory internal property allows test injection",
+      "Dispose: unregisters aggregator from listener, flushes, releases client, releases feature flag context",
+      "All telemetry exceptions swallowed in connection lifecycle",
+      "Telemetry skipped when feature flag disabled",
+      "Existing tests still pass, solution builds"
+    ],
+    "files_to_modify": [
+      "csharp/src/DatabricksConnection.cs"
+    ],
+    "files_to_create": [
+      "csharp/test/Unit/Telemetry/DatabricksConnectionTelemetryTests.cs"
+    ],
+    "test_requirements": [
+      "OpenAsync_TelemetryEnabled_InitializesPipeline: when enabled, TelemetryClientManager.GetOrCreateClient called",
+      "OpenAsync_FeatureFlagDisabled_NoTelemetry: when disabled, no telemetry client created",
+      "Dispose_ReleasesTelemetryClient: connection dispose calls ReleaseClientAsync",
+      "Dispose_FlushesMetricsBeforeRelease: pending metrics flushed before client release",
+      "TestExporterFactory_UsedWhenSet: test factory creates exporter instead of default",
+      "Dispose_ExceptionSwallowed: telemetry cleanup error doesn't propagate",
+      "Note: These may need to be integration-style tests using real connections or careful mocking"
+    ],
+    "allowed_tools": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash"
+    ],
+    "max_turns": 100,
+    "estimated_complexity": "high"
+  },
+  {
+    "id": "task-8.1-connection-activity-tags",
+    "title": "Add telemetry tags to connection activities (session.id, system config, connection params)",
+    "description": "Enhance DatabricksConnection to set telemetry-specific Activity tags during connection open. Add session.id, auth.type, driver.version, driver.name, runtime.*, os.*, client.app_name, locale.name, char_set_encoding, process.name, connection.http_path, connection.host, connection.port, connection.mode, connection.auth_mech, connection.auth_flow, feature.* tags. These tags are set on the Connection.Open activity and are used by MetricsAggregator to populate DriverSystemConfiguration and DriverConnectionParameters in the proto.",
+    "pr_group": "pr-activity-tags",
+    "pr_group_order": 1,
+    "design_context": "Section 4.4.2-4.4.4 of telemetry-design.md: Connection activities need tags for proto population. SetSystemConfigurationTags sets driver.*, runtime.*, os.*, client.*, locale.*, char_set_encoding, process.name. SetConnectionParameterTags sets connection.*, feature.*, auth.*. Tags set in CreateSessionRequest() and HandleOpenSessionResponse() on the Activity? parameter. Sprint plan Task 8 (connection portion).",
+    "dependencies": [],
+    "input_requirements": [
+      "DatabricksConnection.cs with existing CreateSessionRequest and HandleOpenSessionResponse methods",
+      "TagDefinitions/ConnectionOpenEvent.cs with tag name constants",
+      "System.Runtime.InteropServices.RuntimeInformation for OS/runtime info"
+    ],
+    "output_deliverables": [
+      "Modified src/DatabricksConnection.cs with SetSystemConfigurationTags and SetConnectionParameterTags methods",
+      "Test verification that tags are set on activities"
+    ],
+    "exit_criteria": [
+      "session.id tag set from Thrift session handle in HandleOpenSessionResponse",
+      "auth.type tag set based on authentication method (pat, oauth-m2m, etc.)",
+      "Driver tags set: driver.version, driver.name",
+      "Runtime tags set: runtime.name, runtime.version, runtime.vendor",
+      "OS tags set: os.name, os.version, os.arch",
+      "Client tags set: client.app_name, locale.name, char_set_encoding, process.name",
+      "Connection tags set: connection.http_path, connection.host, connection.port, connection.mode",
+      "Auth tags set: connection.auth_mech, connection.auth_flow",
+      "Feature tags set: feature.arrow, feature.direct_results, feature.cloudfetch, feature.lz4",
+      "All existing tests still pass, solution builds"
+    ],
+    "files_to_modify": [
+      "csharp/src/DatabricksConnection.cs"
+    ],
+    "files_to_create": [],
+    "test_requirements": [
+      "Verify Connection.Open activity has session.id tag after open",
+      "Verify system config tags (driver.version, os.name, runtime.name) are set",
+      "Verify connection parameter tags (connection.host, connection.mode) are set",
+      "Verify feature flags tags (feature.cloudfetch, feature.lz4) are set",
+      "Verify auth tags (auth.type, connection.auth_mech) are set",
+      "Note: may require integration tests with real connection or careful activity capture"
+    ],
+    "allowed_tools": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash"
+    ],
+    "max_turns": 100,
+    "estimated_complexity": "medium"
+  },
+  {
+    "id": "task-8.2-statement-activity-tags",
+    "title": "Add telemetry tags to statement and CloudFetch activities (statement.id, result.format, chunk metrics, poll metrics)",
+    "description": "Enhance DatabricksStatement and CloudFetch/Reader components to set telemetry-specific Activity tags. Add statement.id, session.id, statement.type tags to all statement/metadata activities. Propagate session.id and statement.id to child activities. Add result.format, result.compression_enabled, poll.count, poll.latency_ms tags. Add cloudfetch.download_summary ActivityEvent with chunk metrics. Add result.ready_latency_ms and result.consumption_latency_ms tags.",
+    "pr_group": "pr-activity-tags",
+    "pr_group_order": 2,
+    "design_context": "Section 2.3, 4.4.5-4.4.8, 4.4.10 of telemetry-design.md: Statement activities need statement.id and session.id tags. Child activities must explicitly propagate these tags (not inherited in .NET). CloudFetch downloads emit cloudfetch.download_summary event with total_files, successful_downloads, total_time_ms, initial_chunk_latency_ms, slowest_chunk_latency_ms. Polling emits poll.count and poll.latency_ms. Result latency tracked via result.ready_latency_ms. Sprint plan Task 8 (statement/CloudFetch portion).",
+    "dependencies": [
+      "task-8.1-connection-activity-tags"
+    ],
+    "input_requirements": [
+      "DatabricksStatement.cs with existing TraceActivityAsync calls",
+      "DatabricksConnection.cs with session.id available",
+      "CloudFetch downloader components",
+      "TagDefinitions/StatementExecutionEvent.cs with tag name constants"
+    ],
+    "output_deliverables": [
+      "Modified src/DatabricksStatement.cs with statement telemetry tags",
+      "Modified CloudFetch/Reader components with chunk and result latency tags"
+    ],
+    "exit_criteria": [
+      "All statement/metadata activities have statement.id and session.id tags",
+      "Child activities propagate session.id and statement.id from parent",
+      "statement.type tag set (query, update, metadata)",
+      "result.format tag set (cloudfetch, inline_arrow)",
+      "result.compression_enabled tag set",
+      "CloudFetch downloads emit cloudfetch.download_summary ActivityEvent with chunk metrics",
+      "poll.count and poll.latency_ms tags set on polling activities",
+      "result.ready_latency_ms tag set on statement activities",
+      "All existing tests still pass, solution builds"
+    ],
+    "files_to_modify": [
+      "csharp/src/DatabricksStatement.cs"
+    ],
+    "files_to_create": [],
+    "test_requirements": [
+      "Statement activity has statement.id and session.id tags",
+      "Metadata activities (GetCatalogs, etc.) have statement.id and session.id tags",
+      "Child activity propagates routing tags from parent",
+      "CloudFetch download summary event contains correct chunk metrics",
+      "Note: some tags may need integration tests or careful mocking of activity context"
+    ],
+    "allowed_tools": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash"
+    ],
+    "max_turns": 100,
+    "estimated_complexity": "high"
+  },
+  {
+    "id": "task-9.1-e2e-test-infrastructure",
+    "title": "Create E2E telemetry test infrastructure (CapturingExporter, TelemetryTestHelpers)",
+    "description": "Create test infrastructure for E2E telemetry testing. Implement CapturingTelemetryExporter that captures exported TelemetryFrontendLog instances. Create TelemetryTestHelpers with CreateConnectionWithTelemetry and CreateConnectionWithCapturingTelemetry helper methods. These helpers set up DatabricksConnection with TestExporterFactory injected for test capture without real HTTP calls to the telemetry endpoint.",
+    "pr_group": "pr-e2e-tests",
+    "pr_group_order": 1,
+    "design_context": "Section 3.2 (Test Injection Pattern) of telemetry-design.md: CapturingTelemetryExporter implements ITelemetryExporter, stores logs in a ConcurrentBag/List. TelemetryTestHelpers.CreateConnectionWithTelemetry creates connection with injected mock exporter. CreateConnectionWithCapturingTelemetry combines both. Test flow: create connection with capturing exporter \u2192 execute operations \u2192 assert on captured logs. Sprint plan Task 9 test infrastructure.",
+    "dependencies": [
+      "task-7.1-connection-integration"
+    ],
+    "input_requirements": [
+      "DatabricksConnection with TestExporterFactory property",
+      "ITelemetryExporter interface",
+      "TelemetryFrontendLog model",
+      "Environment variables for Databricks connection (DATABRICKS_HOST, DATABRICKS_TOKEN, DATABRICKS_HTTP_PATH)"
+    ],
+    "output_deliverables": [
+      "test/E2E/Telemetry/CapturingTelemetryExporter.cs - Test exporter that captures logs",
+      "test/E2E/Telemetry/TelemetryTestHelpers.cs - Helper methods for telemetry test setup"
+    ],
+    "exit_criteria": [
+      "CapturingTelemetryExporter implements ITelemetryExporter, thread-safe log capture",
+      "TelemetryTestHelpers.CreateConnectionWithTelemetry builds connection with injected exporter",
+      "TelemetryTestHelpers.CreateConnectionWithCapturingTelemetry returns (connection, capturedLogs) tuple",
+      "Helpers use environment variables for connection properties",
+      "Solution builds successfully"
+    ],
+    "files_to_modify": [],
+    "files_to_create": [
+      "csharp/test/E2E/Telemetry/CapturingTelemetryExporter.cs",
+      "csharp/test/E2E/Telemetry/TelemetryTestHelpers.cs"
+    ],
+    "test_requirements": [
+      "Infra classes compile and can be used by test methods",
+      "CapturingTelemetryExporter correctly stores exported logs",
+      "Helpers correctly configure connection with TestExporterFactory"
+    ],
+    "allowed_tools": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash"
+    ],
+    "max_turns": 100,
+    "estimated_complexity": "low"
+  },
+  {
+    "id": "task-9.2-e2e-telemetry-tests",
+    "title": "Implement comprehensive E2E telemetry tests for the complete pipeline",
+    "description": "Create comprehensive E2E tests verifying the complete telemetry pipeline from driver operation to captured telemetry logs. Test connection events, statement execution events, error events, CloudFetch metrics, multi-connection client sharing, circuit breaker behavior, and graceful shutdown. All tests use CapturingTelemetryExporter and TelemetryTestHelpers for test isolation.",
+    "pr_group": "pr-e2e-tests",
+    "pr_group_order": 2,
+    "design_context": "Sprint plan Task 9: E2E tests. Section 10 of telemetry-design.md testing strategy. Tests verify: connection event exported on open, statement event with latency, CloudFetch chunk metrics, error events with error_type, multiple connections share client, circuit breaker stops exporting, graceful shutdown flushes all events, feature flag disabled prevents export.",
+    "dependencies": [
+      "task-9.1-e2e-test-infrastructure",
+      "task-8.2-statement-activity-tags"
+    ],
+    "input_requirements": [
+      "CapturingTelemetryExporter and TelemetryTestHelpers from previous task",
+      "All telemetry components integrated into DatabricksConnection",
+      "Activity tags set on connection and statement activities",
+      "Live Databricks environment via env vars (DATABRICKS_HOST, DATABRICKS_TOKEN, DATABRICKS_HTTP_PATH)"
+    ],
+    "output_deliverables": [
+      "test/E2E/Telemetry/TelemetryE2ETests.cs - Comprehensive E2E test suite"
+    ],
+    "exit_criteria": [
+      "Telemetry_Connection_ExportsConnectionEvent: open connection, verify connection event captured",
+      "Telemetry_Statement_ExportsStatementEvent: execute SELECT 1, verify statement event with latency",
+      "Telemetry_Error_ExportsErrorEvent: invalid SQL, verify error event with error.type",
+      "Telemetry_FeatureFlagDisabled_NoExport: feature flag off, no events exported",
+      "Telemetry_MultipleConnections_SharesClient: 2+ connections to same host, single client",
+      "Telemetry_GracefulShutdown_FlushesEvents: close with pending events, all flushed",
+      "All E2E tests pass against live Databricks environment"
+    ],
+    "files_to_modify": [],
+    "files_to_create": [
+      "csharp/test/E2E/Telemetry/TelemetryE2ETests.cs"
+    ],
+    "test_requirements": [
+      "Telemetry_Connection_ExportsConnectionEvent: verify session.id, driver.version in captured log",
+      "Telemetry_Statement_ExportsStatementEvent: verify statement.id, operation_latency_ms > 0",
+      "Telemetry_CloudFetch_ExportsChunkMetrics: large query, verify chunk_count, bytes_downloaded (if CloudFetch enabled)",
+      "Telemetry_Error_ExportsErrorEvent: invalid SQL, verify error.type tag in captured log",
+      "Telemetry_FeatureFlagDisabled_NoExport: set telemetry.enabled=false, no events captured",
+      "Telemetry_MultipleConnections_SharesClient: 3 connections same host, single TelemetryClient",
+      "Telemetry_GracefulShutdown_FlushesEvents: execute queries, close, verify all events captured",
+      "Tests may use [Trait] or similar for E2E categorization"
+    ],
+    "allowed_tools": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash"
+    ],
+    "max_turns": 100,
+    "estimated_complexity": "high"
+  }
+]

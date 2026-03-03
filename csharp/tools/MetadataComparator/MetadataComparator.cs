@@ -59,6 +59,7 @@ namespace AdbcDrivers.Databricks.Examples
             WriteLine("╚════════════════════════════════════════════════════════════════════════════════╝");
             WriteLine();
 
+            await CompareGetInfo(config);
             await CompareGetCatalogs(config);
             await CompareGetSchemas(config);
             await CompareGetTables(config);

@@ -54,10 +54,13 @@ namespace AdbcDrivers.Databricks.Tests.Unit.Telemetry.TagDefinitions
             Assert.NotNull(tags);
             Assert.Contains("statement.id", tags);
             Assert.Contains("session.id", tags);
+            Assert.Contains("statement.type", tags);
             Assert.Contains("result.format", tags);
             Assert.Contains("result.chunk_count", tags);
             Assert.Contains("result.bytes_downloaded", tags);
             Assert.Contains("result.compression_enabled", tags);
+            Assert.Contains("result.ready_latency_ms", tags);
+            Assert.Contains("result.consumption_latency_ms", tags);
             Assert.Contains("poll.count", tags);
             Assert.Contains("poll.latency_ms", tags);
         }
@@ -214,13 +217,17 @@ namespace AdbcDrivers.Databricks.Tests.Unit.Telemetry.TagDefinitions
             // Assert
             Assert.Equal("statement.id", StatementExecutionEvent.StatementId);
             Assert.Equal("session.id", StatementExecutionEvent.SessionId);
+            Assert.Equal("statement.type", StatementExecutionEvent.StatementType);
             Assert.Equal("result.format", StatementExecutionEvent.ResultFormat);
             Assert.Equal("result.chunk_count", StatementExecutionEvent.ResultChunkCount);
             Assert.Equal("result.bytes_downloaded", StatementExecutionEvent.ResultBytesDownloaded);
             Assert.Equal("result.compression_enabled", StatementExecutionEvent.ResultCompressionEnabled);
+            Assert.Equal("result.ready_latency_ms", StatementExecutionEvent.ResultReadyLatencyMs);
+            Assert.Equal("result.consumption_latency_ms", StatementExecutionEvent.ResultConsumptionLatencyMs);
             Assert.Equal("poll.count", StatementExecutionEvent.PollCount);
             Assert.Equal("poll.latency_ms", StatementExecutionEvent.PollLatencyMs);
             Assert.Equal("db.statement", StatementExecutionEvent.DbStatement);
+            Assert.Equal("cloudfetch.download_summary", StatementExecutionEvent.CloudFetchDownloadSummaryEvent);
         }
 
         [Fact]
@@ -229,8 +236,9 @@ namespace AdbcDrivers.Databricks.Tests.Unit.Telemetry.TagDefinitions
             // Act
             var tags = StatementExecutionEvent.GetDatabricksExportTags();
 
-            // Assert - 8 tags should be exported (excludes db.statement)
-            Assert.Equal(8, tags.Count);
+            // Assert - 11 tags should be exported (excludes db.statement)
+            // Original 8 plus 3 new: statement.type, result.ready_latency_ms, result.consumption_latency_ms
+            Assert.Equal(11, tags.Count);
         }
 
         #endregion

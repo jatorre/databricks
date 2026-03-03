@@ -28,6 +28,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using AdbcDrivers.Databricks.Result;
+using AdbcDrivers.Databricks.Telemetry.TagDefinitions;
 using Apache.Arrow;
 using Apache.Arrow.Adbc;
 using AdbcDrivers.HiveServer2;
@@ -123,6 +124,15 @@ namespace AdbcDrivers.Databricks
 
         protected override void SetStatementProperties(TExecuteStatementReq statement)
         {
+            // Propagate telemetry routing tags to child activity (SetStatementProperties runs inside
+            // the ExecuteStatementAsync child activity). In .NET, Activity tags are not inherited.
+            var parentActivity = Activity.Current?.Parent;
+            Activity.Current?.SetTag(StatementExecutionEvent.SessionId,
+                parentActivity?.GetTagItem(StatementExecutionEvent.SessionId) ?? GetSessionId());
+            Activity.Current?.SetTag(StatementExecutionEvent.StatementId,
+                parentActivity?.GetTagItem(StatementExecutionEvent.StatementId));
+            Activity.Current?.SetTag(StatementExecutionEvent.ResultCompressionEnabled, canDecompressLz4);
+
             Activity.Current?.AddEvent("statement.set_properties.start");
 
             base.SetStatementProperties(statement);
@@ -308,6 +318,42 @@ namespace AdbcDrivers.Databricks
             this.maxBytesPerFile = maxBytesPerFile;
         }
 
+        #region Telemetry Helpers
+
+        /// <summary>
+        /// Gets the session ID from the connection's Thrift session handle.
+        /// Returns a GUID string (format "N") or null if the session handle is not available.
+        /// </summary>
+        private string? GetSessionId()
+        {
+            var sessionHandle = Connection.SessionHandle;
+            if (sessionHandle?.SessionId?.Guid != null && sessionHandle.SessionId.Guid.Length == 16)
+            {
+                return new Guid(sessionHandle.SessionId.Guid).ToString("N");
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Sets common telemetry routing tags on the given activity.
+        /// These tags are required for the MetricsAggregator to correctly route and aggregate telemetry data.
+        /// In .NET, Activity tags are NOT inherited by child activities, so these must be explicitly set
+        /// on every activity that needs to be processed by the telemetry pipeline.
+        /// </summary>
+        /// <param name="activity">The activity to set tags on.</param>
+        /// <param name="statementType">The statement type: "query", "update", or "metadata".</param>
+        /// <param name="statementId">Optional statement ID. If null, a new GUID is generated.</param>
+        private void SetStatementTelemetryTags(Activity? activity, string statementType, string? statementId = null)
+        {
+            if (activity == null) return;
+
+            activity.SetTag(StatementExecutionEvent.SessionId, GetSessionId());
+            activity.SetTag(StatementExecutionEvent.StatementId, statementId ?? Guid.NewGuid().ToString("N"));
+            activity.SetTag(StatementExecutionEvent.StatementType, statementType);
+        }
+
+        #endregion
+
         /// <summary>
         /// Helper method to handle the special case for the "SPARK" catalog in metadata queries.
         ///
@@ -370,6 +416,7 @@ namespace AdbcDrivers.Databricks
         {
             return await this.TraceActivityAsync(async activity =>
             {
+                SetStatementTelemetryTags(activity, "metadata");
                 activity?.AddEvent("statement.get_catalogs.start");
                 activity?.SetTag("statement.feature.enable_multiple_catalog_support", enableMultipleCatalogSupport);
 
@@ -418,6 +465,7 @@ namespace AdbcDrivers.Databricks
         {
             return await this.TraceActivityAsync(async activity =>
             {
+                SetStatementTelemetryTags(activity, "metadata");
                 activity?.AddEvent("statement.get_schemas.start");
                 activity?.SetTag("statement.catalog_name", CatalogName ?? "(none)");
                 activity?.SetTag("statement.feature.enable_multiple_catalog_support", enableMultipleCatalogSupport);
@@ -474,6 +522,7 @@ namespace AdbcDrivers.Databricks
         {
             return await this.TraceActivityAsync(async activity =>
             {
+                SetStatementTelemetryTags(activity, "metadata");
                 activity?.AddEvent("statement.get_tables.start");
                 activity?.SetTag("statement.catalog_name", CatalogName ?? "(none)");
                 activity?.SetTag("statement.schema_name", SchemaName ?? "(none)");
@@ -552,6 +601,7 @@ namespace AdbcDrivers.Databricks
         {
             return await this.TraceActivityAsync(async activity =>
             {
+                SetStatementTelemetryTags(activity, "metadata");
                 activity?.AddEvent("statement.get_columns.start");
                 activity?.SetTag("statement.catalog_name", CatalogName ?? "(none)");
                 activity?.SetTag("statement.schema_name", SchemaName ?? "(none)");
@@ -633,6 +683,7 @@ namespace AdbcDrivers.Databricks
         {
             return await this.TraceActivityAsync(async activity =>
             {
+                SetStatementTelemetryTags(activity, "metadata");
                 activity?.AddEvent("statement.get_primary_keys.start");
                 activity?.SetTag("statement.catalog_name", CatalogName ?? "(none)");
                 activity?.SetTag("statement.schema_name", SchemaName ?? "(none)");
@@ -688,6 +739,7 @@ namespace AdbcDrivers.Databricks
         {
             return await this.TraceActivityAsync(async activity =>
             {
+                SetStatementTelemetryTags(activity, "metadata");
                 activity?.AddEvent("statement.get_cross_reference.start");
                 activity?.SetTag("statement.catalog_name", CatalogName ?? "(none)");
                 activity?.SetTag("statement.schema_name", SchemaName ?? "(none)");
@@ -719,6 +771,7 @@ namespace AdbcDrivers.Databricks
         {
             return await this.TraceActivityAsync(async activity =>
             {
+                SetStatementTelemetryTags(activity, "metadata");
                 activity?.AddEvent("statement.get_cross_reference_as_foreign_table.start");
                 activity?.SetTag("statement.catalog_name", CatalogName ?? "(none)");
                 activity?.SetTag("statement.foreign_catalog_name", ForeignCatalogName ?? "(none)");
@@ -788,6 +841,7 @@ namespace AdbcDrivers.Databricks
         {
             return await this.TraceActivityAsync(async activity =>
             {
+                SetStatementTelemetryTags(activity, "metadata");
                 activity?.AddEvent("statement.get_columns_extended.start");
                 string? fullTableName = BuildTableName();
                 var canUseDescTableExtended = ((DatabricksConnection)Connection).CanUseDescTableExtended;
@@ -893,6 +947,50 @@ namespace AdbcDrivers.Databricks
         public override string AssemblyName => DatabricksConnection.s_assemblyName;
 
         public override string AssemblyVersion => DatabricksConnection.s_assemblyVersion;
+
+        /// <summary>
+        /// Overrides ExecuteQueryAsync to wrap the base execution with a telemetry activity
+        /// that captures statement.id, session.id, statement.type, result latency, and compression tags.
+        /// </summary>
+        public override async ValueTask<QueryResult> ExecuteQueryAsync()
+        {
+            return await this.TraceActivityAsync(async activity =>
+            {
+                var statementId = Guid.NewGuid().ToString("N");
+                SetStatementTelemetryTags(activity, "query", statementId);
+                activity?.SetTag(StatementExecutionEvent.ResultCompressionEnabled, canDecompressLz4);
+
+                var stopwatch = Stopwatch.StartNew();
+                var result = await base.ExecuteQueryAsync();
+                stopwatch.Stop();
+
+                activity?.SetTag(StatementExecutionEvent.ResultReadyLatencyMs, stopwatch.ElapsedMilliseconds);
+
+                return result;
+            }, activityName: "ExecuteQuery");
+        }
+
+        /// <summary>
+        /// Overrides ExecuteUpdateAsync to wrap the base execution with a telemetry activity
+        /// that captures statement.id, session.id, statement.type, and result latency tags.
+        /// </summary>
+        public override async Task<UpdateResult> ExecuteUpdateAsync()
+        {
+            return await this.TraceActivityAsync(async activity =>
+            {
+                var statementId = Guid.NewGuid().ToString("N");
+                SetStatementTelemetryTags(activity, "update", statementId);
+                activity?.SetTag(StatementExecutionEvent.ResultCompressionEnabled, canDecompressLz4);
+
+                var stopwatch = Stopwatch.StartNew();
+                var result = await base.ExecuteUpdateAsync();
+                stopwatch.Stop();
+
+                activity?.SetTag(StatementExecutionEvent.ResultReadyLatencyMs, stopwatch.ElapsedMilliseconds);
+
+                return result;
+            }, activityName: "ExecuteUpdate");
+        }
 
         /// <summary>
         /// Creates the schema for the column metadata result set.

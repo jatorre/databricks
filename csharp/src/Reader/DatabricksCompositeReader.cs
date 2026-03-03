@@ -27,6 +27,7 @@ using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using AdbcDrivers.Databricks.Reader.CloudFetch;
+using AdbcDrivers.Databricks.Telemetry.TagDefinitions;
 using Apache.Arrow;
 using AdbcDrivers.HiveServer2.Hive2;
 using Apache.Arrow.Adbc.Tracing;
@@ -108,11 +109,17 @@ namespace AdbcDrivers.Databricks.Reader
         private BaseDatabricksReader DetermineReader(TFetchResultsResp initialResults, Activity? activity = null)
         {
             bool useCloudFetch = ShouldUseCloudFetch(initialResults);
+            string resultFormat = useCloudFetch ? "cloudfetch" : "inline_arrow";
+
             activity?.AddEvent("composite_reader.determine_reader", [
                 new("use_cloudfetch", useCloudFetch),
                 new("has_result_links", initialResults.__isset.results && initialResults.Results.__isset.resultLinks),
                 new("result_links_count", initialResults.Results?.ResultLinks?.Count ?? 0)
             ]);
+
+            // Set result.format and compression tags on the current activity
+            activity?.SetTag(StatementExecutionEvent.ResultFormat, resultFormat);
+            activity?.SetTag(StatementExecutionEvent.ResultCompressionEnabled, _isLz4Compressed);
 
             if (useCloudFetch)
             {
@@ -188,6 +195,16 @@ namespace AdbcDrivers.Databricks.Reader
         {
             return await this.TraceActivityAsync(async activity =>
             {
+                // Propagate telemetry routing tags from parent activity
+                var parentActivity = Activity.Current?.Parent;
+                if (parentActivity != null)
+                {
+                    activity?.SetTag(StatementExecutionEvent.SessionId,
+                        parentActivity.GetTagItem(StatementExecutionEvent.SessionId));
+                    activity?.SetTag(StatementExecutionEvent.StatementId,
+                        parentActivity.GetTagItem(StatementExecutionEvent.StatementId));
+                }
+
                 if (_activeReader != null)
                 {
                     activity?.SetTag("reader.active_reader_type", _activeReader.GetType().Name);

@@ -103,6 +103,33 @@ namespace AdbcDrivers.Databricks.Telemetry.TagDefinitions
         public const string PollLatencyMs = "poll.latency_ms";
 
         /// <summary>
+        /// Statement type (query, update, metadata).
+        /// Exported to Databricks telemetry service.
+        /// </summary>
+        [TelemetryTag("statement.type",
+            ExportScope = TagExportScope.ExportDatabricks,
+            Description = "Statement type: query, update, metadata")]
+        public const string StatementType = "statement.type";
+
+        /// <summary>
+        /// Time from execute to first row available in milliseconds.
+        /// Exported to Databricks telemetry service.
+        /// </summary>
+        [TelemetryTag("result.ready_latency_ms",
+            ExportScope = TagExportScope.ExportDatabricks,
+            Description = "Time from execute to result ready (ms)")]
+        public const string ResultReadyLatencyMs = "result.ready_latency_ms";
+
+        /// <summary>
+        /// Time from first row to last row consumed in milliseconds.
+        /// Exported to Databricks telemetry service.
+        /// </summary>
+        [TelemetryTag("result.consumption_latency_ms",
+            ExportScope = TagExportScope.ExportDatabricks,
+            Description = "Time from first row to last row consumed (ms)")]
+        public const string ResultConsumptionLatencyMs = "result.consumption_latency_ms";
+
+        /// <summary>
         /// SQL query text.
         /// Only exported to local diagnostics (sensitive data).
         /// </summary>
@@ -110,6 +137,11 @@ namespace AdbcDrivers.Databricks.Telemetry.TagDefinitions
             ExportScope = TagExportScope.ExportLocal,
             Description = "SQL query text (local diagnostics only)")]
         public const string DbStatement = "db.statement";
+
+        /// <summary>
+        /// The event name for CloudFetch download summary.
+        /// </summary>
+        public const string CloudFetchDownloadSummaryEvent = "cloudfetch.download_summary";
 
         /// <summary>
         /// Gets all tags that should be exported to Databricks telemetry service.
@@ -121,10 +153,13 @@ namespace AdbcDrivers.Databricks.Telemetry.TagDefinitions
             {
                 StatementId,
                 SessionId,
+                StatementType,
                 ResultFormat,
                 ResultChunkCount,
                 ResultBytesDownloaded,
                 ResultCompressionEnabled,
+                ResultReadyLatencyMs,
+                ResultConsumptionLatencyMs,
                 PollCount,
                 PollLatencyMs
             };

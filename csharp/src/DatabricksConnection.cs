@@ -445,6 +445,22 @@ namespace AdbcDrivers.Databricks
                 isLz4Compressed = metadataResp.Lz4Compressed;
             }
 
+            // Propagate telemetry routing tags to child activities.
+            // NewReader is called inside base statement execution activities that don't inherit parent tags.
+            var parentActivity = Activity.Current?.Parent;
+            if (parentActivity != null)
+            {
+                Activity.Current?.SetTag(StatementExecutionEvent.SessionId,
+                    Activity.Current?.GetTagItem(StatementExecutionEvent.SessionId)
+                    ?? parentActivity.GetTagItem(StatementExecutionEvent.SessionId));
+                Activity.Current?.SetTag(StatementExecutionEvent.StatementId,
+                    Activity.Current?.GetTagItem(StatementExecutionEvent.StatementId)
+                    ?? parentActivity.GetTagItem(StatementExecutionEvent.StatementId));
+            }
+
+            // Set compression tag on current activity
+            Activity.Current?.SetTag(StatementExecutionEvent.ResultCompressionEnabled, isLz4Compressed);
+
             HttpClient httpClient = HttpClientFactory.CreateCloudFetchHttpClient(Properties);
             return new DatabricksCompositeReader(databricksStatement, schema, response, isLz4Compressed, httpClient);
         }

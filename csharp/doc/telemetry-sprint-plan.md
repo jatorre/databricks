@@ -590,29 +590,53 @@ Implement the core telemetry infrastructure including feature flag management, p
 ---
 
 #### WI-5.4: DatabricksActivityListener
-**Description**: Listens to Activity events and delegates to MetricsAggregator.
+**Description**: Global singleton ActivityListener that subscribes to the "Databricks.Adbc.Driver" ActivitySource and routes activities to per-connection MetricsAggregator instances based on session.id tag.
+
+**Status**: ✅ **COMPLETED**
 
 **Location**: `csharp/src/Telemetry/DatabricksActivityListener.cs`
 
 **Input**:
-- Host string
-- ITelemetryClient
-- TelemetryConfiguration
+- Activities from the "Databricks.Adbc.Driver" ActivitySource
+- Per-connection MetricsAggregator instances registered by session ID
 
 **Output**:
-- Metrics collected from driver activities
+- Activities routed to correct per-connection aggregator
 - All exceptions swallowed
 
 **Test Expectations**:
 
 | Test Type | Test Name | Input | Expected Output |
 |-----------|-----------|-------|-----------------|
-| Unit | `DatabricksActivityListener_Start_ListensToDatabricksActivitySource` | N/A | ShouldListenTo returns true for "Databricks.Adbc.Driver" |
-| Unit | `DatabricksActivityListener_ActivityStopped_ProcessesActivity` | Activity stops | MetricsAggregator.ProcessActivity called |
-| Unit | `DatabricksActivityListener_ActivityStopped_ExceptionSwallowed` | Aggregator throws | No exception propagated |
-| Unit | `DatabricksActivityListener_Sample_FeatureFlagDisabled_ReturnsNone` | Config.Enabled=false | ActivitySamplingResult.None |
-| Unit | `DatabricksActivityListener_Sample_FeatureFlagEnabled_ReturnsAllData` | Config.Enabled=true | ActivitySamplingResult.AllDataAndRecorded |
-| Unit | `DatabricksActivityListener_StopAsync_FlushesAndDisposes` | N/A | Aggregator.FlushAsync called, resources disposed |
+| Unit | `Start_ListensToDatabricksActivitySource` | Driver ActivitySource | ShouldListenTo returns true for "Databricks.Adbc.Driver" |
+| Unit | `Start_IgnoresOtherActivitySources` | Other ActivitySource | ShouldListenTo returns false |
+| Unit | `RegisterAggregator_AddsToRegistry` | sessionId + aggregator | RegisteredAggregatorCount increases |
+| Unit | `UnregisterAggregatorAsync_RemovesAndFlushes` | Registered sessionId | Removed from registry, FlushAsync called |
+| Unit | `ActivityStopped_RoutesToCorrectAggregator` | Activity with session.id | Correct aggregator's ProcessActivity called |
+| Unit | `ActivityStopped_NoSessionId_Ignored` | Activity without session.id | No aggregator called |
+| Unit | `ActivityStopped_UnknownSessionId_Ignored` | Activity with unregistered session.id | No error |
+| Unit | `ActivityStopped_ExceptionSwallowed` | Aggregator throws | No exception propagated |
+| Unit | `Sample_ReturnsAllDataAndRecorded` | Sample callback | ActivitySamplingResult.AllDataAndRecorded |
+| Unit | `Dispose_DisposesListener` | Dispose | ActivityListener disposed, aggregators cleared |
+
+**Implementation Notes**:
+- **Global singleton with Lazy<T>**: Uses `Lazy<DatabricksActivityListener>` for thread-safe singleton initialization via `Instance` property
+- **ConcurrentDictionary<string, MetricsAggregator>**: Routes activities by `session.id` tag to per-connection aggregators
+- **RegisterAggregator/UnregisterAggregatorAsync**: Connections register on open, unregister on close (with flush)
+- **Start()**: Creates and registers ActivityListener with ShouldListenTo, ActivityStopped, and Sample callbacks
+- **OnActivityStopped**: Extracts `session.id` tag, looks up aggregator, calls `ProcessActivity`. Activities without session.id or with unknown session.id are silently ignored.
+- **Sample callback**: Always returns `AllDataAndRecorded` to capture all activity data
+- **Exception swallowing**: All callbacks wrapped in try-catch with `Debug.WriteLine` at TRACE level
+- **CreateForTesting()**: Factory method for test isolation (creates independent instance separate from singleton)
+- Comprehensive test coverage with 29 unit tests in `DatabricksActivityListenerTests.cs`
+- Test file location: `csharp/test/Unit/Telemetry/DatabricksActivityListenerTests.cs`
+
+**Key Design Decisions**:
+1. **Global singleton pattern**: Unlike the original design which described per-connection listeners, this is a global singleton that routes to per-connection aggregators. This avoids multiple ActivityListeners competing for the same ActivitySource.
+2. **Session.id routing**: Activities are routed based on `session.id` tag rather than creating separate listeners per connection. This is more efficient and avoids ActivityListener lifecycle management complexity.
+3. **No feature-flag-based sampling**: The Sample callback always returns AllDataAndRecorded. Feature flag control is handled at the connection level (whether to register an aggregator) rather than at the listener level.
+4. **Lazy initialization**: The singleton is created lazily on first access, not eagerly at application start.
+5. **Test isolation**: `CreateForTesting()` factory method allows tests to create independent instances without affecting the global singleton.
 
 ---
 

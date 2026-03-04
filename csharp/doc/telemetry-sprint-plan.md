@@ -294,6 +294,8 @@ Implement the core telemetry infrastructure including feature flag management, p
 #### WI-3.2: CircuitBreakerManager
 **Description**: Singleton that manages circuit breakers per host.
 
+**Status**: ✅ **COMPLETED**
+
 **Location**: `csharp/src/Telemetry/CircuitBreakerManager.cs`
 
 **Input**:
@@ -309,6 +311,31 @@ Implement the core telemetry infrastructure including feature flag management, p
 | Unit | `CircuitBreakerManager_GetCircuitBreaker_NewHost_CreatesBreaker` | "host1.databricks.com" | New CircuitBreaker instance |
 | Unit | `CircuitBreakerManager_GetCircuitBreaker_SameHost_ReturnsSameBreaker` | Same host twice | Same CircuitBreaker instance |
 | Unit | `CircuitBreakerManager_GetCircuitBreaker_DifferentHosts_CreatesSeparateBreakers` | "host1", "host2" | Different CircuitBreaker instances |
+
+**Implementation Notes**:
+- Singleton pattern using `private static readonly` instance with `GetInstance()` method
+- Uses `ConcurrentDictionary<string, CircuitBreaker>` with `StringComparer.OrdinalIgnoreCase` for case-insensitive host matching
+- `GetOrAdd` ensures thread-safe atomic creation of circuit breakers
+- Two overloads for `GetCircuitBreaker`: default config and custom config (failureThreshold + timeout)
+- `RemoveCircuitBreaker(host)` for cleanup when last connection to a host is closed
+- `Reset()` internal method for test isolation
+- Input validation: throws `ArgumentNullException` for null, `ArgumentException` for empty/whitespace hosts
+- Comprehensive test coverage with 23 unit tests including:
+  - Singleton verification
+  - Same host returns same instance (including case-insensitive)
+  - Different hosts get separate instances with independent state
+  - Thread safety with 10 concurrent threads for same host
+  - Thread safety with 20 concurrent threads for different hosts
+  - Mixed concurrent access (50 threads, 5 hosts, 10 threads per host)
+  - Input validation, remove, and reset operations
+- Test file location: `csharp/test/Unit/Telemetry/CircuitBreakerManagerTests.cs`
+
+**Key Design Decisions**:
+1. **Case-insensitive host matching**: Uses `StringComparer.OrdinalIgnoreCase` since DNS hostnames are case-insensitive
+2. **Lazy creation**: Circuit breakers are created on first access via `GetOrAdd`, not pre-allocated
+3. **Config-ignored on existing**: When a breaker already exists for a host, the config overload returns the existing instance (config parameters are ignored)
+4. **Polly-backed**: Each circuit breaker uses the existing Polly-based `CircuitBreaker` class
+5. **No reference counting**: Unlike `TelemetryClientManager`, the circuit breaker manager uses simple add/remove since circuit breakers are lightweight stateless-ish objects
 
 ---
 

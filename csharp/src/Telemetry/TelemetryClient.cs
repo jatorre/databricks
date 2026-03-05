@@ -68,13 +68,15 @@ namespace AdbcDrivers.Databricks.Telemetry
         /// <param name="httpClient">The HTTP client to use for exporting telemetry.</param>
         /// <param name="isAuthenticated">Whether the connection is authenticated (determines telemetry endpoint).</param>
         /// <param name="configuration">The telemetry configuration.</param>
+        /// <param name="exporterOverride">Optional exporter override for testing.</param>
         /// <exception cref="ArgumentNullException">Thrown when host, httpClient, or configuration is null.</exception>
         /// <exception cref="ArgumentException">Thrown when host is empty or whitespace.</exception>
         public TelemetryClient(
             string host,
             System.Net.Http.HttpClient httpClient,
             bool isAuthenticated,
-            TelemetryConfiguration configuration)
+            TelemetryConfiguration configuration,
+            ITelemetryExporter? exporterOverride = null)
         {
             if (string.IsNullOrWhiteSpace(host))
             {
@@ -104,12 +106,12 @@ namespace AdbcDrivers.Databricks.Telemetry
                 // 2. CircuitBreakerTelemetryExporter (wraps exporter with circuit breaker protection)
                 _circuitBreakerExporter = new CircuitBreakerTelemetryExporter(_databricksExporter, host);
 
-                // Store the effective exporter for direct Enqueue path
-                _effectiveExporter = _circuitBreakerExporter;
+                // Use override exporter if provided (for testing), otherwise use circuit breaker exporter
+                _effectiveExporter = exporterOverride ?? (ITelemetryExporter)_circuitBreakerExporter;
 
-                // 3. MetricsAggregator (aggregates activities and exports via circuit breaker)
+                // 3. MetricsAggregator (aggregates activities and exports via the effective exporter)
                 _metricsAggregator = new MetricsAggregator(
-                    _circuitBreakerExporter,
+                    _effectiveExporter,
                     batchSize: configuration.BatchSize,
                     flushInterval: TimeSpan.FromMilliseconds(configuration.FlushIntervalMs));
 

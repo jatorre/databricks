@@ -48,6 +48,13 @@ namespace AdbcDrivers.Databricks.Telemetry
         private readonly ConcurrentDictionary<string, TelemetryClientHolder> _clients = new ConcurrentDictionary<string, TelemetryClientHolder>();
 
         /// <summary>
+        /// Optional exporter override for testing. When set, newly created TelemetryClients
+        /// use this exporter instead of the default DatabricksTelemetryExporter pipeline.
+        /// Must be set before connections are opened and cleared after tests complete.
+        /// </summary>
+        internal static ITelemetryExporter? ExporterOverride { get; set; }
+
+        /// <summary>
         /// Private constructor to enforce singleton pattern.
         /// </summary>
         private TelemetryClientManager()
@@ -93,7 +100,7 @@ namespace AdbcDrivers.Databricks.Telemetry
         {
             TelemetryClientHolder holder = _clients.AddOrUpdate(
                 host,
-                _ => new TelemetryClientHolder(new TelemetryClient(host, httpClient, isAuthenticated, config)),
+                _ => new TelemetryClientHolder(new TelemetryClient(host, httpClient, isAuthenticated, config, ExporterOverride)),
                 (_, existing) =>
                 {
                     Interlocked.Increment(ref existing._refCount);

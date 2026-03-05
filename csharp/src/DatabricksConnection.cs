@@ -36,6 +36,7 @@ using AdbcDrivers.Databricks.Auth;
 using AdbcDrivers.Databricks.Http;
 using AdbcDrivers.Databricks.Reader;
 using AdbcDrivers.Databricks.Telemetry;
+using AdbcDrivers.Databricks.Telemetry.Proto;
 using AdbcDrivers.Databricks.Telemetry.TagDefinitions;
 using Apache.Arrow;
 using Apache.Arrow.Adbc;
@@ -997,6 +998,72 @@ namespace AdbcDrivers.Databricks
         }
 
         /// <summary>
+        /// Builds a <see cref="DriverSystemConfiguration"/> proto from the current connection state.
+        /// </summary>
+        private DriverSystemConfiguration BuildSystemConfiguration()
+        {
+            string? entryAssemblyName = System.Reflection.Assembly.GetEntryAssembly()?.GetName().Name;
+
+            return new DriverSystemConfiguration
+            {
+                DriverName = "Apache Arrow ADBC Databricks Driver",
+                DriverVersion = s_assemblyVersion,
+                RuntimeName = RuntimeInformation.FrameworkDescription,
+                RuntimeVersion = Environment.Version.ToString(),
+                RuntimeVendor = "Microsoft",
+                OsName = RuntimeInformation.OSDescription,
+                OsVersion = Environment.OSVersion.Version.ToString(),
+                OsArch = RuntimeInformation.OSArchitecture.ToString(),
+                ClientAppName = entryAssemblyName ?? "unknown",
+                LocaleName = CultureInfo.CurrentCulture.Name,
+                CharSetEncoding = Encoding.Default.WebName,
+                ProcessName = Process.GetCurrentProcess().ProcessName
+            };
+        }
+
+        /// <summary>
+        /// Builds a <see cref="DriverConnectionParameters"/> proto from the current connection properties.
+        /// </summary>
+        private DriverConnectionParameters BuildConnectionParameters()
+        {
+            Properties.TryGetValue(SparkParameters.Path, out string? httpPath);
+            Properties.TryGetValue(SparkParameters.HostName, out string? host);
+            Properties.TryGetValue(SparkParameters.Port, out string? port);
+            Properties.TryGetValue(DatabricksParameters.Protocol, out string? protocol);
+            Properties.TryGetValue(SparkParameters.AuthType, out string? authMech);
+            Properties.TryGetValue(DatabricksParameters.OAuthGrantType, out string? authFlow);
+            Properties.TryGetValue(HttpProxyOptions.UseProxy, out string? useProxy);
+            Properties.TryGetValue(ApacheParameters.BatchSize, out string? batchSizeStr);
+            Properties.TryGetValue(ApacheParameters.PollTimeMilliseconds, out string? pollIntervalStr);
+
+            int portValue = (port != null && int.TryParse(port, out int parsedPort)) ? parsedPort : 443;
+            long batchSizeValue = (batchSizeStr != null && long.TryParse(batchSizeStr, out long parsedBatchSize))
+                ? parsedBatchSize
+                : DatabricksConstants.DefaultBatchSize;
+            int pollIntervalValue = (pollIntervalStr != null && int.TryParse(pollIntervalStr, out int parsedPollInterval))
+                ? parsedPollInterval
+                : DatabricksConstants.DefaultAsyncExecPollIntervalMs;
+
+            return new DriverConnectionParameters
+            {
+                HttpPath = httpPath ?? string.Empty,
+                Mode = StatementTelemetryContext.ParseDriverMode(protocol ?? "thrift"),
+                HostInfo = new HostDetails
+                {
+                    HostUrl = host ?? string.Empty,
+                    Port = portValue
+                },
+                UseProxy = string.Equals(useProxy, "true", StringComparison.OrdinalIgnoreCase),
+                AuthMech = StatementTelemetryContext.ParseAuthMech(authMech),
+                AuthFlow = StatementTelemetryContext.ParseAuthFlow(authFlow),
+                EnableArrow = true,
+                EnableDirectResults = _enableDirectResults,
+                RowsFetchedPerBlock = batchSizeValue,
+                AsyncPollIntervalMillis = pollIntervalValue
+            };
+        }
+
+        /// <summary>
         /// Determines the authentication type string for telemetry.
         /// </summary>
         /// <returns>A string describing the auth type (e.g., "pat", "oauth-m2m", "oauth", "basic", "token").</returns>
@@ -1077,7 +1144,9 @@ namespace AdbcDrivers.Databricks
                 string? sessionId = GetSessionIdString();
                 if (sessionId != null)
                 {
-                    _metricsAggregator.SetSessionContext(sessionId, 0, null, null);
+                    DriverSystemConfiguration systemConfig = BuildSystemConfiguration();
+                    DriverConnectionParameters connectionParams = BuildConnectionParameters();
+                    _metricsAggregator.SetSessionContext(sessionId, 0, systemConfig, connectionParams);
                 }
 
                 // Step 6: Register aggregator with the global DatabricksActivityListener

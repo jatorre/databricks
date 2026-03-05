@@ -209,7 +209,7 @@ namespace AdbcDrivers.Databricks.Telemetry
             // Route based on operation name
             string operationName = activity.OperationName ?? string.Empty;
 
-            if (operationName.Contains("ExecuteQuery") || operationName.Contains("ExecuteUpdate"))
+            if (operationName.Contains("ExecuteQuery") || operationName.Contains("ExecuteUpdate") || operationName.Contains("ExecuteStatement"))
             {
                 MergeFromExecuteActivity(activity);
             }

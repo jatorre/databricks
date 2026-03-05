@@ -62,7 +62,7 @@ namespace AdbcDrivers.Databricks.Tests.Unit.Telemetry
             public ValueTask DisposeAsync()
             {
                 IsDisposed = true;
-                return ValueTask.CompletedTask;
+                return default;
             }
         }
 

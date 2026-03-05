@@ -14,33 +14,33 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Databricks ADBC Driver: Activity-Based Telemetry Design V2
+# Databricks ADBC Driver: Direct Object Telemetry Design V3
 
 ## Executive Summary
 
-This document outlines an **Activity-based telemetry design** that leverages the existing Activity/ActivitySource infrastructure in the Databricks ADBC driver. Instead of creating a parallel telemetry system, we extend the current tracing infrastructure to collect metrics and export them to Databricks telemetry service.
+This document outlines a **direct object telemetry design** for the Databricks ADBC driver. Each statement execution holds a `StatementTelemetryContext` object that is populated inline by driver code as operations happen, then exported to Databricks telemetry service on completion.
+
+> **V3 replaces V2's Activity-based collection** (ActivityListener + MetricsAggregator + tag propagation) with direct object population. The export pipeline (TelemetryClient, Exporter, CircuitBreaker) is unchanged. See [Section 11: Alternatives Considered](#11-alternatives-considered) for why the Activity-based approach was replaced.
 
 **Key Objectives:**
-- Reuse existing Activity instrumentation points
-- Add metrics collection without duplicating code
+- Collect telemetry data with minimal complexity
 - Export aggregated metrics to Databricks service
 - Maintain server-side feature flag control
-- Preserve backward compatibility with OpenTelemetry
+- Preserve backward compatibility with OpenTelemetry tracing
 
 **Design Principles:**
-- **Build on existing infrastructure**: Leverage ActivitySource/ActivityListener
-- **Single instrumentation point**: Don't duplicate tracing and metrics
-- **Non-blocking**: All operations async and non-blocking
+- **Direct population**: Statement holds telemetry context, populated inline — no Activity tags, no listeners, no aggregators
+- **Deterministic emission**: Exactly one telemetry event per statement — emitted on reader dispose (success) or catch block (error)
+- **Non-blocking**: All export operations async and non-blocking
 - **Privacy-first**: No PII or query data collected
 - **Server-controlled**: Feature flag support for enable/disable
 
-**Enhanced Production Requirements** (from JDBC driver experience):
+**Production Requirements** (from JDBC driver experience):
 - **Feature flag caching**: Per-host caching to avoid rate limiting
 - **Circuit breaker**: Protect against telemetry endpoint failures
 - **Exception swallowing**: All telemetry exceptions caught with minimal logging
 - **Per-host telemetry client**: One client per host to prevent rate limiting
 - **Graceful shutdown**: Proper cleanup with reference counting
-- **Smart exception flushing**: Only flush terminal exceptions immediately
 
 ---
 
@@ -52,8 +52,8 @@ This document outlines an **Activity-based telemetry design** that leverages the
     - 3.1 [FeatureFlagCache (Per-Host)](#31-featureflagcache-per-host)
     - 3.2 [TelemetryClientManager (Per-Host)](#32-telemetryclientmanager-per-host)
     - 3.3 [Circuit Breaker](#33-circuit-breaker)
-    - 3.4 [DatabricksActivityListener](#34-databricksactivitylistener)
-    - 3.5 [MetricsAggregator](#35-metricsaggregator)
+    - 3.4 [StatementTelemetryContext Lifecycle](#34-statementtelemetrycontext-lifecycle)
+    - 3.5 [Instrumentation Points](#35-instrumentation-points)
     - 3.6 [DatabricksTelemetryExporter](#36-databrickstelemetryexporter)
 4. [Data Collection](#4-data-collection)
 5. [Export Mechanism](#5-export-mechanism)
@@ -83,21 +83,22 @@ The Databricks ADBC driver already has:
 
 ### 1.2 Design Opportunity
 
-The driver already has comprehensive Activity instrumentation for distributed tracing. This presents an opportunity to:
-- Leverage existing Activity infrastructure for both tracing and metrics
-- Avoid duplicate instrumentation points in the driver code
-- Use a single data model (Activity) for both observability concerns
-- Maintain automatic correlation between traces and metrics
-- Reduce overall system complexity and maintenance burden
+The driver needs to collect metrics (latency, result format, error info, etc.) per statement execution and export them to Databricks telemetry service. The key requirements are:
+- Capture complete statement lifecycle data (execute → poll → read → dispose)
+- Export one telemetry event per statement execution
+- **Protocol-agnostic**: Support both Thrift (HiveServer2) and SEA (Statement Execution API) backends
+- No impact on driver performance or correctness
+- Server-side feature flag control
 
 ### 1.3 The Approach
 
-**Extend Activity infrastructure** with metrics collection:
-- ✅ Single instrumentation point (Activity)
-- ✅ Custom ActivityListener for metrics aggregation
-- ✅ Export aggregated data to Databricks service
-- ✅ Reuse Activity context, correlation, and timing
-- ✅ Seamless integration with OpenTelemetry ecosystem
+**Direct object population** — each statement holds a `StatementTelemetryContext` that is populated inline:
+- ✅ Statement creates context at execute time, populates fields as operations happen
+- ✅ Context travels through the call stack via object references
+- ✅ Emitted on statement completion (reader dispose or error catch)
+- ✅ Exported via shared per-host TelemetryClient
+- ✅ **Protocol-agnostic**: Same `StatementTelemetryContext` works for both Thrift and SEA backends
+- ✅ Activity/ActivitySource infrastructure remains for OpenTelemetry tracing (unchanged)
 
 ---
 
@@ -107,24 +108,30 @@ The driver already has comprehensive Activity instrumentation for distributed tr
 
 ```mermaid
 graph TB
-    A[Driver Operations] -->|Activity.Start/Stop| B[ActivitySource]
-    B -->|Activity Events| C[DatabricksActivityListener]
-    C -->|Aggregate Metrics| D[MetricsAggregator]
-    D -->|Batch & Buffer| E[TelemetryClientManager]
-    E -->|Get Per-Host Client| F[TelemetryClient per Host]
+    subgraph PerStatement["Per Statement"]
+        DS[DatabricksStatement] -->|owns| STC[StatementTelemetryContext]
+        DS -->|populates inline| STC
+    end
+
+    subgraph PerConnection["Per Connection"]
+        DC[DatabricksConnection] -->|creates| DS
+        DC -->|provides session context| STC
+    end
+
+    STC -->|BuildTelemetryLog| FE[TelemetryFrontendLog]
+    FE -->|Enqueue| E
+
+    E[TelemetryClientManager] -->|Get Per-Host Client| F[TelemetryClient per Host]
     F -->|Check Circuit Breaker| G[CircuitBreakerWrapper]
     G -->|HTTP POST| H[DatabricksTelemetryExporter]
     H --> I[Databricks Service]
-    I --> J[Lumberjack]
 
-    K[FeatureFlagCache per Host] -.->|Enable/Disable| C
+    K[FeatureFlagCache per Host] -.->|Enable/Disable| DC
     L[Connection Open] -->|Increment RefCount| E
-    L -->|Increment RefCount| K
-    M[Connection Close] -->|Decrement RefCount| E
-    M -->|Decrement RefCount| K
+    M[Connection Close] -->|Flush + Decrement RefCount| E
 
-    style C fill:#e1f5fe
-    style D fill:#e1f5fe
+    style PerStatement fill:#e3f2fd
+    style PerConnection fill:#e8f5e9
     style E fill:#ffe0b2
     style F fill:#ffe0b2
     style G fill:#ffccbc
@@ -132,337 +139,66 @@ graph TB
 ```
 
 **Key Components:**
-1. **ActivitySource** (existing): Emits activities for all operations
-2. **FeatureFlagCache** (new): Per-host caching of feature flags with reference counting
-3. **TelemetryClientManager** (new): Manages one telemetry client per host with reference counting
-4. **CircuitBreakerWrapper** (new): Protects against failing telemetry endpoint
-5. **DatabricksActivityListener** (new): Listens to activities, extracts metrics
-6. **MetricsAggregator** (new): Aggregates by statement, batches events
-7. **DatabricksTelemetryExporter** (new): Exports to Databricks service
+1. **StatementTelemetryContext** (per-statement): Holds all telemetry data, populated inline by driver code
+2. **TelemetrySessionContext** (per-connection): Frozen session-level data shared with all statements
+3. **FeatureFlagCache** (per-host): Caches feature flags with reference counting
+4. **TelemetryClientManager** (per-host): Manages one telemetry client per host with reference counting
+5. **CircuitBreakerWrapper** (per-host): Protects against failing telemetry endpoint
+6. **DatabricksTelemetryExporter** (per-host): Exports to Databricks service
 
-### 2.2 Activity Flow
+### 2.2 Data Flow
 
 ```mermaid
 sequenceDiagram
     participant App as Application
-    participant Driver as DatabricksConnection
-    participant AS as ActivitySource
-    participant AL as ActivityListener
-    participant MA as MetricsAggregator
+    participant Stmt as DatabricksStatement
+    participant Ctx as StatementTelemetryContext
+    participant Reader as CompositeReader
     participant TC as ITelemetryClient
     participant Ex as TelemetryExporter
-    participant Service as Databricks Service
 
-    App->>Driver: ExecuteQueryAsync()
-    Driver->>AS: StartActivity("ExecuteQuery")
-    AS->>AL: ActivityStarted(activity)
+    App->>Stmt: ExecuteQueryAsync()
+    Stmt->>Ctx: new StatementTelemetryContext(sessionContext)
+    Stmt->>Ctx: StatementType = QUERY
+    Stmt->>Stmt: Thrift ExecuteStatement RPC
+    Stmt->>Ctx: StatementId = response.operationId
+    Stmt->>Ctx: RecordExecuteComplete()
 
-    Driver->>Driver: Execute operation
-    Driver->>AS: activity.SetTag("result_format", "CloudFetch")
-    Driver->>AS: activity.AddEvent("ChunkDownload", tags)
+    opt Polling required
+        Stmt->>Ctx: PollCount, PollLatencyMs
+    end
 
-    AS->>AL: ActivityStopped(activity)
-    AL->>MA: ProcessActivity(activity)
-    MA->>MA: Aggregate by statement_id
-    MA->>MA: Build OssSqlDriverTelemetryLog proto
-    MA->>TC: Enqueue(proto)
+    Stmt->>Reader: Create reader with ctx reference
+    Reader->>Ctx: RecordFirstBatchReady()
+    App->>Reader: ReadNextRecordBatchAsync() (loop)
+    App->>Reader: Dispose()
+    Reader->>Ctx: RecordResultsConsumed()
+    Reader->>Ctx: SetChunkDetails(...)
+    Stmt->>Ctx: BuildTelemetryLog() → proto
+    Stmt->>TC: Enqueue(frontendLog)
 
-    alt Batch threshold reached OR flush interval elapsed
-        TC->>Ex: Export(batch)
-        Ex->>Service: POST /telemetry-ext
-        Service-->>Ex: 200 OK
-        Ex-->>TC: Success
+    alt Batch threshold or flush timer
+        TC->>Ex: ExportAsync(batch)
+        Ex-->>TC: HTTP 200
     end
 ```
 
-### 2.3 Activity Hierarchy and Multi-Activity Aggregation
+### 2.3 Component Ownership
 
-#### Understanding .NET Activity Model
+| Component | Level | Responsibility |
+|-----------|-------|----------------|
+| **StatementTelemetryContext** | Per-statement | Holds all telemetry data, populated inline by driver code |
+| **TelemetrySessionContext** | Per-connection | Frozen session-level data (session ID, auth, system config) |
+| **ITelemetryClient** | Per-host (shared) | Batches protos from all connections, manages flush timer |
+| **CircuitBreakerExporter** | Per-host (shared) | Protects against endpoint failures |
+| **DatabricksTelemetryExporter** | Per-host (shared) | HTTP POST to `/telemetry-ext` |
+| **TelemetryClientManager** | Global singleton | Manages per-host clients with reference counting |
 
-**Key concepts:**
-- `ActivityListener` is **global** - it receives callbacks for ALL activities from subscribed ActivitySources
-- Each `TraceActivityAsync()` call creates a **new Activity** that starts and stops
-- Activities can be **nested** - child activities have a `ParentId` linking to parent
-- `AddEvent()` does NOT trigger callbacks - events are stored on the activity and only accessible when it stops
-- `ActivityStopped` callback receives the activity with all its tags and events
-
-#### Activities in ADBC Driver
-
-Each method wrapped in `TraceActivityAsync()` creates an activity. Here are the activities in the codebase:
-
-| Activity Name | Parent | Description |
-|--------------|--------|-------------|
-| `ExecuteQuery` | None (root) | Top-level statement execution |
-| `ExecuteUpdate` | None (root) | Top-level update execution |
-| `GetCatalogs` | None (root) | Metadata: list catalogs |
-| `GetSchemas` | None (root) | Metadata: list schemas |
-| `GetTables` | None (root) | Metadata: list tables |
-| `GetColumns` | None (root) | Metadata: list columns |
-| `DownloadFiles` | ExecuteQuery | CloudFetch download loop |
-| `DownloadSingleFile` | DownloadFiles | Single file download |
-| `ApplyServerSideProperties` | ExecuteQuery | Server-side property setup |
-| `RetryHttpRequest` | Various | HTTP retry wrapper |
-| `FetchFeatureFlags` | Various | Feature flag fetch |
-| `BackgroundRefresh` | None | Background flag refresh |
-
-#### Activity Hierarchy Example
-
-A single `ExecuteQueryAsync()` call generates multiple activities:
-
-```mermaid
-flowchart TD
-    subgraph Root["Root Activity"]
-        EQ["ExecuteQuery<br/>Tags: statement.id, session.id<br/>Events: statement.start, statement.complete"]
-    end
-
-    subgraph Children["Child Activities"]
-        ASP["ApplyServerSideProperties<br/>Tags: property_count<br/>Events: property.set"]
-        DF["DownloadFiles<br/>Tags: total_files<br/>Events: chunk_downloaded (x N)"]
-        RH["RetryHttpRequest<br/>Tags: retry_count, status_code"]
-    end
-
-    EQ --> ASP
-    EQ --> DF
-    EQ --> RH
-
-    style Root fill:#e3f2fd
-    style Children fill:#fff3e0
-```
-
-#### ActivityListener Callback Sequence
-
-**Important**: The listener receives `ActivityStopped` for EVERY activity, not just root:
-
-```mermaid
-sequenceDiagram
-    participant Driver
-    participant AS as ActivitySource
-    participant AL as ActivityListener
-    participant MA as MetricsAggregator
-
-    Driver->>AS: TraceActivityAsync("ExecuteQuery")
-    Note over AS: ExecuteQuery STARTS (root)
-    AS->>AL: ActivityStarted(ExecuteQuery)
-
-    Driver->>AS: TraceActivityAsync("DownloadFiles")
-    Note over AS: DownloadFiles STARTS (child)
-    AS->>AL: ActivityStarted(DownloadFiles)
-
-    Note over AS: DownloadFiles STOPS
-    AS->>AL: ActivityStopped(DownloadFiles)
-    AL->>MA: ProcessActivity(DownloadFiles)
-    Note over MA: Extract chunk metrics,<br/>store by statement_id
-
-    Note over AS: ExecuteQuery STOPS
-    AS->>AL: ActivityStopped(ExecuteQuery)
-    AL->>MA: ProcessActivity(ExecuteQuery)
-    Note over MA: Merge with child data,<br/>statement complete → emit proto
-```
-
-#### Multi-Activity Aggregation Strategy
-
-Since telemetry data is spread across multiple activities, `MetricsAggregator` must:
-
-1. **Collect from all activities** - Receive `ProcessActivity()` for both parent and children
-2. **Key by statement_id** - All activities for same statement share `statement_id` tag
-3. **Merge data incrementally** - Each activity adds its tags/events to the context
-4. **Emit on root completion** - When root activity stops, all data is aggregated → emit proto
-
-```csharp
-internal sealed class MetricsAggregator
-{
-    private readonly ConcurrentDictionary<string, StatementTelemetryContext> _statements = new();
-
-    public void ProcessActivity(Activity activity)
-    {
-        var statementId = activity.GetTagItem("statement.id")?.ToString();
-        if (string.IsNullOrEmpty(statementId)) return;
-
-        var context = _statements.GetOrAdd(statementId, _ => new StatementTelemetryContext());
-
-        // Merge this activity's data into the context
-        context.MergeFrom(activity);
-
-        // Check if this is the root activity completing
-        if (IsRootActivity(activity) && activity.Status != ActivityStatusCode.Unset)
-        {
-            // All child activities have already been processed
-            // Now we have complete data → emit proto
-            var proto = context.BuildProto();
-            _telemetryClient.Enqueue(proto);
-            _statements.TryRemove(statementId, out _);
-        }
-    }
-
-    private bool IsRootActivity(Activity activity)
-    {
-        // Root activities have no parent OR parent is from different ActivitySource
-        return activity.Parent == null ||
-               activity.Parent.Source.Name != "Databricks.Adbc.Driver";
-    }
-}
-```
-
-#### Data Merging from Multiple Activities
-
-```csharp
-internal class StatementTelemetryContext
-{
-    // From root ExecuteQuery activity
-    public string? SessionId { get; set; }
-    public string? StatementId { get; set; }
-    public long OperationLatencyMs { get; set; }
-    public StatementType StatementType { get; set; }
-
-    // From DownloadFiles child activity
-    public ChunkDetails ChunkDetails { get; set; } = new();
-
-    // From polling activities
-    public OperationDetail OperationDetail { get; set; } = new();
-
-    public void MergeFrom(Activity activity)
-    {
-        // Always capture session/statement IDs
-        SessionId ??= activity.GetTagItem("session.id")?.ToString();
-        StatementId ??= activity.GetTagItem("statement.id")?.ToString();
-
-        // Merge based on activity type
-        switch (activity.OperationName)
-        {
-            case "ExecuteQuery":
-            case "ExecuteUpdate":
-                OperationLatencyMs = (long)activity.Duration.TotalMilliseconds;
-                StatementType = ParseStatementType(activity);
-                MergeResultLatency(activity);
-                break;
-
-            case "DownloadFiles":
-                MergeChunkDetails(activity);
-                break;
-
-            case "PollOperationStatus":
-                MergePollingMetrics(activity);
-                break;
-        }
-    }
-
-    private void MergeChunkDetails(Activity activity)
-    {
-        // Extract from activity events
-        foreach (var evt in activity.Events.Where(e => e.Name == "cloudfetch.chunk_downloaded"))
-        {
-            ChunkDetails.TotalChunksIterated++;
-            var latency = evt.Tags.FirstOrDefault(t => t.Key == "latency_ms").Value as long? ?? 0;
-            ChunkDetails.SumChunksDownloadTimeMillis += latency;
-            // Track initial and slowest
-            if (ChunkDetails.TotalChunksIterated == 1)
-                ChunkDetails.InitialChunkLatencyMillis = latency;
-            if (latency > ChunkDetails.SlowestChunkLatencyMillis)
-                ChunkDetails.SlowestChunkLatencyMillis = latency;
-        }
-
-        // Or from tags if summarized
-        if (activity.GetTagItem("cloudfetch.total_chunks") is int total)
-            ChunkDetails.TotalChunksPresent = total;
-    }
-}
-```
-
-#### Flush Trigger: When to Emit Proto
-
-The proto is emitted when the **root activity** for a statement stops:
-
-| Trigger | Behavior |
-|---------|----------|
-| Root activity stops (success) | Emit proto immediately |
-| Root activity stops (error) | Emit proto with error_info |
-| Connection closes | Flush all pending statement contexts |
-| Timeout (optional) | Emit partial proto if statement abandoned |
-
-**Why root activity?**
-- All child activities have already stopped (and been processed)
-- Child activities stop BEFORE parent (stack unwinding)
-- When root stops, we have complete aggregated data
-
-#### Required Activity Tags for Telemetry
-
-**Critical**: .NET Activity tags are NOT inherited by child activities. Each activity must explicitly set the tags needed for routing and aggregation.
-
-**Mandatory tags for ALL activities:**
-
-| Tag | Purpose | Must Be Set By |
-|-----|---------|----------------|
-| `session.id` | Route to correct aggregator | Parent activity propagates to children |
-| `statement.id` | Group activities for same statement | Parent activity propagates to children |
-
-**Activity-specific tags:**
-
-| Activity | Required Tags | Description |
-|----------|---------------|-------------|
-| `ExecuteQuery` | `session.id`, `statement.id`, `result.format` | Root statement activity |
-| `ExecuteUpdate` | `session.id`, `statement.id` | Root update activity |
-| `GetCatalogs/Schemas/Tables/Columns` | `session.id`, `statement.id` | Metadata operations |
-| `DownloadFiles` | `session.id`, `statement.id`, `cloudfetch.*` | CloudFetch metrics |
-| `PollOperationStatus` | `session.id`, `statement.id`, `poll.*` | Polling metrics |
-
-**Tag Propagation Pattern:**
-
-Since child activities don't inherit tags, we must explicitly propagate them:
-
-```csharp
-// In root activity (e.g., ExecuteQuery)
-return await this.TraceActivityAsync(async activity =>
-{
-    // Set routing/aggregation tags
-    activity?.SetTag("session.id", _connection.SessionId);
-    activity?.SetTag("statement.id", statementId);
-
-    // Child activities need these tags too
-    await DownloadFilesAsync(activity);  // Pass parent activity
-});
-
-// In child activity (e.g., DownloadFiles)
-private async Task DownloadFilesAsync(Activity? parentActivity)
-{
-    return await this.TraceActivityAsync(async activity =>
-    {
-        // Propagate routing tags from parent
-        activity?.SetTag("session.id", parentActivity?.GetTagItem("session.id"));
-        activity?.SetTag("statement.id", parentActivity?.GetTagItem("statement.id"));
-
-        // Set child-specific tags
-        activity?.SetTag("cloudfetch.total_chunks", totalChunks);
-        activity?.SetTag("cloudfetch.initial_latency_ms", initialLatency);
-    });
-}
-```
-
-**Alternative: Use Activity.Current for Propagation**
-
-Since `TraceActivityAsync` sets `Activity.Current`, child activities can read from parent:
-
-```csharp
-// In child activity - read from parent via Activity.Current
-return await this.TraceActivityAsync(async activity =>
-{
-    // Get parent's tags via Activity.Current.Parent
-    var parent = Activity.Current?.Parent;
-    activity?.SetTag("session.id", parent?.GetTagItem("session.id"));
-    activity?.SetTag("statement.id", parent?.GetTagItem("statement.id"));
-
-    // Set child-specific tags
-    activity?.SetTag("cloudfetch.total_chunks", totalChunks);
-});
-```
-
-**Implementation Checklist:**
-
-- [ ] Add `session.id` tag to Connection.Open activity
-- [ ] Add `statement.id` tag to all statement/metadata activities
-- [ ] Propagate `session.id` and `statement.id` to all child activities
-- [ ] Add CloudFetch summary tags (`cloudfetch.total_chunks`, `cloudfetch.initial_latency_ms`, etc.)
-- [ ] Add polling metrics tags (`poll.count`, `poll.latency_ms`)
-- [ ] Verify all activities have routing tags before enabling telemetry
+**Key concepts (V3):**
+- No `ActivityListener` — telemetry data is populated directly on `StatementTelemetryContext`
+- No tag propagation needed (context is passed as object reference)
+- No operation name matching needed (fields set directly)
+- Exactly one emit per statement (reader dispose or error catch)
 
 ---
 
@@ -901,9 +637,8 @@ flowchart TB
     subgraph PerConnection["PER-CONNECTION (owned by DatabricksConnection)"]
         direction TB
         DC[DatabricksConnection]
-        DC --> DAL[DatabricksActivityListener]
-        DAL --> MA[MetricsAggregator]
-        MA -->|sends TelemetryFrontendLog| boundary[ ]
+        DC -->|creates| STC[StatementTelemetryContext]
+        STC -->|BuildTelemetryLog + Enqueue| boundary[ ]
     end
 
     subgraph PerHost["PER-HOST (shared via singleton managers)"]
@@ -923,7 +658,7 @@ flowchart TB
 ```
 
 **ITelemetryClient responsibilities:**
-- Receives events from multiple MetricsAggregators
+- Receives events from multiple connections
 - Batches events from all connections to same host
 - Single flush timer per host
 
@@ -931,7 +666,7 @@ flowchart TB
 
 | Component | Level | Batching Role |
 |-----------|-------|---------------|
-| **MetricsAggregator** | Per-connection | Aggregates multiple activities for the same `statement_id` into one proto message |
+| **StatementTelemetryContext** | Per-statement | Holds telemetry data, populated inline by driver code |
 | **ITelemetryClient** | Per-host | Batches proto messages from all connections before HTTP export |
 
 **Example flow with 2 connections:**
@@ -941,7 +676,7 @@ flowchart TB
     subgraph Conn1["Connection 1"]
         S1A["Statement A<br/>(5 activities)"]
         S1B["Statement B<br/>(3 activities)"]
-        MA1["MetricsAggregator 1"]
+        MA1["Statement contexts"]
         S1A --> MA1
         S1B --> MA1
         MA1 -->|"A → 1 proto<br/>B → 1 proto"| out1[ ]
@@ -950,7 +685,7 @@ flowchart TB
     subgraph Conn2["Connection 2"]
         S2C["Statement C<br/>(3 activities)"]
         S2D["Statement D<br/>(2 activities)"]
-        MA2["MetricsAggregator 2"]
+        MA2["Statement contexts"]
         S2C --> MA2
         S2D --> MA2
         MA2 -->|"C → 1 proto<br/>D → 1 proto"| out2[ ]
@@ -981,7 +716,7 @@ Without per-host sharing, each connection would make separate HTTP requests, pot
 namespace AdbcDrivers.Databricks.Telemetry
 {
     /// <summary>
-    /// Client that receives telemetry events from MetricsAggregators and exports them.
+    /// Client that receives telemetry events from connections and exports them.
     /// One instance is shared per host via TelemetryClientManager.
     /// </summary>
     internal interface ITelemetryClient : IAsyncDisposable
@@ -989,7 +724,7 @@ namespace AdbcDrivers.Databricks.Telemetry
         /// <summary>
         /// Queue a telemetry log for export. Non-blocking, thread-safe.
         /// Events are batched and flushed periodically or when batch size is reached.
-        /// Called by MetricsAggregator when a statement completes.
+        /// Called by DatabricksStatement when a statement completes.
         /// </summary>
         void Enqueue(TelemetryFrontendLog log);
 
@@ -1218,8 +953,7 @@ namespace AdbcDrivers.Databricks.Telemetry
 public sealed class DatabricksConnection : SparkHttpConnection
 {
     private ITelemetryClient? _telemetryClient;
-    private MetricsAggregator? _metricsAggregator;
-    private DatabricksActivityListener? _activityListener;
+    private TelemetrySessionContext? _telemetrySessionContext;
 
     protected override async Task OpenAsyncCore(CancellationToken ct)
     {
@@ -1235,11 +969,8 @@ public sealed class DatabricksConnection : SparkHttpConnection
                     _telemetryConfig);
 
             // Create per-connection aggregator that sends to shared client
-            _metricsAggregator = new MetricsAggregator(_telemetryClient, _telemetryConfig);
-
-            // Create listener that feeds the aggregator
-            _activityListener = new DatabricksActivityListener(_metricsAggregator);
-            _activityListener.Start();
+            // Build frozen session context (shared with all statements)
+            _telemetrySessionContext = BuildTelemetrySessionContext();
         }
     }
 
@@ -1280,8 +1011,8 @@ public sealed class DatabricksConnection : SparkHttpConnection
 
 | Component | Level | Responsibility |
 |-----------|-------|----------------|
-| **DatabricksActivityListener** | Per-connection | Listens to Activity events, forwards to aggregator |
-| **MetricsAggregator** | Per-connection | Aggregates activities by `statement_id` into proto messages |
+| **StatementTelemetryContext** | Per-statement | Holds telemetry data, populated inline by driver code |
+| **TelemetrySessionContext** | Per-connection | Frozen session-level data shared with all statements |
 | **ITelemetryClient** | Per-host (shared) | Batches protos from all connections, manages flush timer |
 | **CircuitBreakerWrapper** | Per-host (shared) | Protects against endpoint failures |
 | **DatabricksTelemetryExporter** | Per-host (shared) | HTTP POST to `/telemetry-ext` |
@@ -1509,448 +1240,382 @@ namespace AdbcDrivers.Databricks.Telemetry
 
 ---
 
-### 3.4 DatabricksActivityListener (Global Singleton)
+### 3.4 StatementTelemetryContext Lifecycle
 
-**Purpose**: Listen to Activity events and route them to MetricsAggregator for telemetry processing.
+**Purpose**: Hold all telemetry data for a single statement execution. Populated directly by driver code — no Activity tags, no listeners, no aggregators.
 
-**Location**: `Apache.Arrow.Adbc.Drivers.Databricks.Telemetry.DatabricksActivityListener`
+**Location**: `AdbcDrivers.Databricks.Telemetry.StatementTelemetryContext`
 
-**Scope**: **Global singleton** - One listener receives activities from ALL connections.
-
-#### Why Global?
-
-.NET `ActivityListener` is inherently global - when registered, it receives callbacks for ALL activities from subscribed ActivitySources, regardless of which thread/connection created them.
+#### Lifecycle
 
 ```mermaid
-flowchart TB
-    subgraph Connections["Multiple Connections"]
-        C1["Connection 1<br/>session-1"]
-        C2["Connection 2<br/>session-2"]
-        C3["Connection 3<br/>session-3"]
-    end
-
-    subgraph Activities["Activities (all go to same listener)"]
-        A1["ExecuteQuery<br/>session.id=session-1"]
-        A2["GetCatalogs<br/>session.id=session-2"]
-        A3["DownloadFiles<br/>session.id=session-1"]
-    end
-
-    subgraph Listener["Global ActivityListener"]
-        AL["DatabricksActivityListener<br/>(singleton)"]
-    end
-
-    C1 --> A1
-    C1 --> A3
-    C2 --> A2
-
-    A1 --> AL
-    A2 --> AL
-    A3 --> AL
-
-    AL -->|"route by session.id"| MA1["MetricsAggregator<br/>session-1"]
-    AL -->|"route by session.id"| MA2["MetricsAggregator<br/>session-2"]
-
-    style Listener fill:#e1f5fe
+stateDiagram-v2
+    [*] --> Created: Statement.ExecuteQueryAsync()
+    Created --> Executing: Thrift ExecuteStatement RPC
+    Executing --> Polling: PollForResponse (if needed)
+    Polling --> ReadingResults: First batch available
+    Executing --> ReadingResults: Direct results
+    ReadingResults --> Emitted: Reader dispose or error
+    Emitted --> [*]: Enqueue to TelemetryClient
 ```
+
+The context lives for the full duration of a statement execution — from `ExecuteQueryAsync()` to reader disposal. This naturally captures the complete lifecycle without timing or ordering issues.
 
 #### Interface
 
 ```csharp
-namespace AdbcDrivers.Databricks.Telemetry
+internal sealed class StatementTelemetryContext
 {
-    /// <summary>
-    /// Global ActivityListener that receives all Databricks activities.
-    /// Routes activities to the appropriate MetricsAggregator based on session_id.
-    /// All exceptions are swallowed to prevent impacting driver operations.
-    /// </summary>
-    public sealed class DatabricksActivityListener : IDisposable
+    // ── Populated at construction (from connection session context) ──
+    public string? SessionId { get; }
+    public string? AuthType { get; }
+    public DriverSystemConfiguration? SystemConfiguration { get; }
+    public DriverConnectionParameters? DriverConnectionParams { get; }
+
+    // ── Populated by Statement during execution ──
+    public string? StatementId { get; set; }
+    public StatementType StatementType { get; set; }
+    public OperationType OperationType { get; set; }
+    public ExecutionResultFormat ResultFormat { get; set; }
+    public bool IsCompressed { get; set; }
+
+    // ── Timing ──
+    public Stopwatch ExecuteStopwatch { get; }      // Started at construction
+    public long? PollCount { get; set; }
+    public long? PollLatencyMs { get; set; }
+    public long? FirstBatchReadyMs { get; set; }    // Elapsed ms from start
+    public long? ResultsConsumedMs { get; set; }    // Elapsed ms from start
+
+    // ── CloudFetch chunk details ──
+    public int? TotalChunksPresent { get; set; }
+    public int? TotalChunksIterated { get; set; }
+    public long? InitialChunkLatencyMs { get; set; }
+    public long? SlowestChunkLatencyMs { get; set; }
+    public long? SumChunksDownloadTimeMs { get; set; }
+
+    // ── Error info ──
+    public bool HasError { get; set; }
+    public string? ErrorName { get; set; }
+    public string? ErrorMessage { get; set; }
+
+    // ── Build final proto ──
+    public OssSqlDriverTelemetryLog BuildTelemetryLog();
+}
+```
+
+**Contract:**
+- Construction: receives immutable session-level context from connection
+- Mutation: only the owning statement thread writes (no concurrent access needed)
+- `BuildTelemetryLog()`: constructs the proto once at emit time
+- All timing derives from a single `Stopwatch` started at construction
+
+#### Session Context (from Connection)
+
+`DatabricksConnection` prepares a frozen session context during `InitializeTelemetry()`:
+
+```csharp
+internal sealed class TelemetrySessionContext
+{
+    public string? SessionId { get; init; }
+    public string? AuthType { get; init; }
+    public long WorkspaceId { get; init; }
+    public DriverSystemConfiguration? SystemConfiguration { get; init; }
+    public DriverConnectionParameters? DriverConnectionParams { get; init; }
+    public ExecutionResultFormat DefaultResultFormat { get; init; }
+    public bool DefaultCompressionEnabled { get; init; }
+    public ITelemetryClient? TelemetryClient { get; init; }
+}
+```
+
+Created once at connection open. Shared (read-only) with all statements on that connection. The `DriverConnectionParams.Mode` field captures the protocol: `DRIVER_MODE_THRIFT` or `DRIVER_MODE_SEA`.
+
+#### Emit Timing
+
+| Scenario | Emit Trigger | Data Completeness |
+|----------|-------------|-------------------|
+| Normal query | Reader dispose → Statement finalization | Complete |
+| Error during execute | Catch block in ExecuteQueryAsync | Partial (no result latency) |
+| Connection close | Flush any pending context | Partial |
+
+**Guarantee**: Exactly one emission per statement — either on success (reader dispose) or on error (catch block).
+
+#### Shared Telemetry Base (`DatabricksStatement`)
+
+The telemetry lifecycle is identical for both protocols. `DatabricksStatement` serves as the shared base that owns the context and provides helper methods. Protocol-specific subclasses (`ThriftStatement`, `SeaStatement`) call these helpers — they never interact with `TelemetryClient` or `TelemetryFrontendLog` directly.
+
+```mermaid
+classDiagram
+    class DatabricksStatement {
+        <<abstract>>
+        #StatementTelemetryContext? _telemetryContext
+        #CreateTelemetryContext() StatementTelemetryContext
+        #EmitTelemetry()
+        #RecordError(Exception)
+        +ExecuteQueryAsync()* Task~QueryResult~
+    }
+
+    class ThriftStatement {
+        +ExecuteQueryAsync() Task~QueryResult~
+        -ExecuteStatementAsync()
+        -PollForResponseAsync()
+    }
+
+    class SeaStatement {
+        +ExecuteQueryAsync() Task~QueryResult~
+        -ExecuteAsync()
+        -PollAsync()
+    }
+
+    DatabricksStatement <|-- ThriftStatement
+    DatabricksStatement <|-- SeaStatement
+    DatabricksStatement --> StatementTelemetryContext
+```
+
+**Shared base provides:**
+
+```csharp
+internal abstract class DatabricksStatement
+{
+    protected StatementTelemetryContext? _telemetryContext;
+
+    /// Creates context from connection's session context. Called at start of ExecuteQueryAsync.
+    protected StatementTelemetryContext CreateTelemetryContext()
     {
-        private static readonly Lazy<DatabricksActivityListener> _instance =
-            new(() => new DatabricksActivityListener());
+        return new StatementTelemetryContext(_connection.TelemetrySessionContext);
+    }
 
-        public static DatabricksActivityListener Instance => _instance.Value;
+    /// Builds proto, wraps in FrontendLog, enqueues to TelemetryClient. Called once on completion.
+    protected void EmitTelemetry()
+    {
+        try
+        {
+            if (_telemetryContext == null) return;
+            var proto = _telemetryContext.BuildTelemetryLog();
+            var frontendLog = WrapInFrontendLog(proto);
+            _connection.TelemetrySessionContext?.TelemetryClient?.Enqueue(frontendLog);
+        }
+        catch { /* swallow */ }
+    }
 
-        // Registry of aggregators by session_id
-        private readonly ConcurrentDictionary<string, MetricsAggregator> _aggregators = new();
-
-        private DatabricksActivityListener() { }
-
-        /// <summary>
-        /// Register a connection's aggregator. Called on connection open.
-        /// </summary>
-        public void RegisterAggregator(string sessionId, MetricsAggregator aggregator);
-
-        /// <summary>
-        /// Unregister and flush a connection's aggregator. Called on connection close.
-        /// </summary>
-        public Task UnregisterAggregatorAsync(string sessionId);
-
-        /// <summary>
-        /// Start listening to activities (called once at driver initialization).
-        /// </summary>
-        public void Start();
-
-        public void Dispose();
+    /// Records error info on the context. Called in catch blocks.
+    protected void RecordError(Exception ex)
+    {
+        if (_telemetryContext == null) return;
+        _telemetryContext.HasError = true;
+        _telemetryContext.ErrorName = ex.GetType().Name;
+        _telemetryContext.ErrorMessage = ex.Message;
     }
 }
 ```
 
-#### Activity Listener Configuration
+**Protocol subclasses just call the helpers:**
 
 ```csharp
-private ActivityListener CreateListener()
+// ThriftStatement
+public override async Task<QueryResult> ExecuteQueryAsync()
 {
-    return new ActivityListener
-    {
-        // Listen to all Databricks driver activities
-        ShouldListenTo = source =>
-            source.Name == "Databricks.Adbc.Driver",
-
-        // Receive callbacks when activities stop
-        ActivityStopped = OnActivityStopped,
-
-        // Enable recording of all data (tags, events)
-        Sample = (ref ActivityCreationOptions<ActivityContext> options) =>
-            ActivitySamplingResult.AllDataAndRecorded
-    };
-}
-
-private void OnActivityStopped(Activity activity)
-{
+    _telemetryContext = CreateTelemetryContext();
     try
     {
-        // Extract session_id to route to correct aggregator
-        var sessionId = activity.GetTagItem("session.id")?.ToString();
-        if (string.IsNullOrEmpty(sessionId)) return;
-
-        // Route to the connection's aggregator
-        if (_aggregators.TryGetValue(sessionId, out var aggregator))
-        {
-            aggregator.ProcessActivity(activity);
-        }
+        _telemetryContext.StatementType = StatementType.StatementQuery;
+        _telemetryContext.OperationType = OperationType.OperationExecuteStatement;
+        // ... thrift-specific execute, poll, create reader ...
+        return result;
     }
     catch (Exception ex)
     {
-        // Swallow all exceptions - never impact driver operation
-        Debug.WriteLine($"[TRACE] Telemetry error: {ex.Message}");
+        RecordError(ex);
+        EmitTelemetry();
+        throw;
+    }
+}
+
+// SeaStatement — same pattern
+public override async Task<QueryResult> ExecuteQueryAsync()
+{
+    _telemetryContext = CreateTelemetryContext();
+    try
+    {
+        _telemetryContext.StatementType = StatementType.StatementQuery;
+        _telemetryContext.OperationType = OperationType.OperationExecuteStatement;
+        // ... SEA-specific execute, poll, create reader ...
+        return result;
+    }
+    catch (Exception ex)
+    {
+        RecordError(ex);
+        EmitTelemetry();
+        throw;
     }
 }
 ```
 
-#### Key Behaviors
-
-**Receives ALL Activities**:
-- Gets `ActivityStopped` for both parent and child activities
-- A single statement execution triggers multiple callbacks (see Section 2.3)
-- Must handle activities in any order (children stop before parents)
-
-**Routes by session.id**:
-- Each activity has `session.id` tag identifying its connection
-- Routes to the correct `MetricsAggregator` for that connection
-- Activities without `session.id` are ignored
-
-**Thread Safety**:
-- `ConcurrentDictionary` for aggregator registry
-- Each `MetricsAggregator` handles its own thread safety
-- Callbacks may come from any thread
-
-**Exception Handling**:
-- Wraps all callbacks in try-catch
-- Never throws exceptions to Activity infrastructure
-- Logs at TRACE level only to avoid customer anxiety
+**What this eliminates:**
+- No telemetry code duplicated between Thrift and SEA
+- Protocol subclasses only set protocol-specific fields (e.g., `StatementId` from their respective responses)
+- `CreateTelemetryContext()`, `EmitTelemetry()`, `RecordError()` are written once in the base
+- Readers also receive the same `_telemetryContext` and call `RecordFirstBatchReady()` / `RecordResultsConsumed()` regardless of protocol
 
 ---
 
-### 3.5 MetricsAggregator (Per-Connection)
+### 3.5 Instrumentation Points
 
-**Purpose**: Aggregate data from MULTIPLE activities into a single proto message per statement.
+**Purpose**: Document exactly where telemetry data is populated in the driver code.
 
-**Location**: `Apache.Arrow.Adbc.Drivers.Databricks.Telemetry.MetricsAggregator`
-
-**Ownership**: **Per-connection** - Each `DatabricksConnection` owns its own `MetricsAggregator` instance, registered with the global `DatabricksActivityListener`.
-
-#### Core Challenge: Multi-Activity Aggregation
-
-A single statement execution generates MULTIPLE activities (see Section 2.3). Each activity carries different parts of the telemetry data:
-
-```mermaid
-flowchart TB
-    subgraph Statement["Statement Execution (stmt-123)"]
-        direction TB
-        A1["Activity: ExecuteQuery<br/>Tags: statement.id, operation_latency<br/>Events: statement.start, statement.complete"]
-        A2["Activity: DownloadFiles<br/>Tags: total_files, total_bytes<br/>Events: chunk_downloaded (×N)"]
-        A3["Activity: PollStatus<br/>Tags: poll_count, poll_latency"]
-    end
-
-    subgraph Aggregator["MetricsAggregator"]
-        CTX["StatementTelemetryContext<br/>statement_id = stmt-123<br/>━━━━━━━━━━━━━━━━━━━━<br/>operation_latency_ms ← A1<br/>chunk_details ← A2<br/>operation_detail ← A3"]
-    end
-
-    subgraph Proto["Final Proto"]
-        P["OssSqlDriverTelemetryLog<br/>statement_id: stmt-123<br/>operation_latency_ms: 1500<br/>chunk_details: {...}<br/>operation_detail: {...}"]
-    end
-
-    A1 -->|"ProcessActivity()"| CTX
-    A2 -->|"ProcessActivity()"| CTX
-    A3 -->|"ProcessActivity()"| CTX
-    CTX -->|"Root activity stops"| P
-
-    style Statement fill:#fff3e0
-    style Aggregator fill:#e3f2fd
-    style Proto fill:#e8f5e9
-```
-
-#### Why Per-Connection?
-
-The global `DatabricksActivityListener` routes activities to aggregators by `session.id`:
-
-```mermaid
-flowchart LR
-    subgraph Global["Global ActivityListener"]
-        AL["Receives ALL activities"]
-    end
-
-    subgraph Conn1["Connection 1 (session-1)"]
-        MA1["MetricsAggregator 1<br/>_statements = {stmt-A, stmt-B}"]
-    end
-
-    subgraph Conn2["Connection 2 (session-2)"]
-        MA2["MetricsAggregator 2<br/>_statements = {stmt-C, stmt-D}"]
-    end
-
-    AL -->|"session.id=session-1"| MA1
-    AL -->|"session.id=session-2"| MA2
-
-    MA1 --> TC["Shared ITelemetryClient<br/>(per-host)"]
-    MA2 --> TC
-
-    style Global fill:#e1f5fe
-    style Conn1 fill:#e3f2fd,stroke:#1976d2
-    style Conn2 fill:#e8f5e9,stroke:#388e3c
-```
-
-Each aggregator:
-- Is registered with the global listener on connection open
-- Receives only activities for its connection (routed by `session.id`)
-- Tracks statement contexts keyed by `statement_id`
-- Sends completed protos to the **shared** `ITelemetryClient` (per-host)
-
-**JDBC References**:
-- `TelemetryCollector.java:29-30` - Per-statement aggregation using `ConcurrentHashMap<String, StatementTelemetryDetails>`
-- `TelemetryEvent.java:8-12` - Both `session_id` and `sql_statement_id` fields in exported events
-- See PRs: [#1163](https://github.com/databricks/databricks-jdbc/pull/1163), [#1082](https://github.com/databricks/databricks-jdbc/pull/1082)
-
-#### Interface
-
-```csharp
-namespace AdbcDrivers.Databricks.Telemetry
-{
-    /// <summary>
-    /// Per-connection aggregator that collects data from MULTIPLE activities
-    /// and creates a single proto message per statement.
-    /// </summary>
-    internal sealed class MetricsAggregator : IDisposable
-    {
-        private readonly ITelemetryClient _telemetryClient;  // Shared per-host client
-        private readonly TelemetryConfiguration _config;
-        private readonly ConcurrentDictionary<string, StatementTelemetryContext> _statements = new();
-        private string? _sessionId;
-        private DriverSystemConfiguration? _systemConfig;
-        private DriverConnectionParameters? _connectionParams;
-
-        public MetricsAggregator(
-            ITelemetryClient telemetryClient,
-            TelemetryConfiguration config)
-        {
-            _telemetryClient = telemetryClient;
-            _config = config;
-        }
-
-        /// <summary>
-        /// Process an activity. Called for EVERY activity (parent and children).
-        /// Extracts tags/events and merges into the statement context.
-        /// If this is a root activity completing, emits the proto.
-        /// </summary>
-        public void ProcessActivity(Activity activity)
-        {
-            var statementId = activity.GetTagItem("statement.id")?.ToString();
-            if (string.IsNullOrEmpty(statementId)) return;
-
-            // Get or create context for this statement
-            var context = _statements.GetOrAdd(statementId,
-                _ => new StatementTelemetryContext(_sessionId, _systemConfig, _connectionParams));
-
-            // Merge this activity's data into context
-            context.MergeFrom(activity);
-
-            // If this is root activity completing, emit proto
-            if (IsRootActivity(activity) && IsActivityComplete(activity))
-            {
-                EmitProto(statementId, context);
-                _statements.TryRemove(statementId, out _);
-            }
-        }
-
-        /// <summary>
-        /// Flush all pending statement contexts. Called on connection close.
-        /// </summary>
-        public Task FlushAsync(CancellationToken ct = default);
-
-        private bool IsRootActivity(Activity activity)
-        {
-            // Root = no parent, or parent from different ActivitySource
-            return activity.Parent == null ||
-                   activity.Parent.Source.Name != "Databricks.Adbc.Driver";
-        }
-
-        private bool IsActivityComplete(Activity activity)
-        {
-            return activity.Status == ActivityStatusCode.Ok ||
-                   activity.Status == ActivityStatusCode.Error;
-        }
-    }
-}
-```
-
-#### Multi-Activity Processing Flow
+Each driver operation populates the `StatementTelemetryContext` directly. The shared base handles context creation and emission; protocol subclasses only set protocol-specific fields:
 
 ```mermaid
 sequenceDiagram
-    participant AL as ActivityListener
-    participant MA as MetricsAggregator
-    participant CTX as StatementContext
-    participant TC as ITelemetryClient
+    participant Stmt as DatabricksStatement
+    participant Ctx as StatementTelemetryContext
+    participant Reader as CompositeReader
 
-    Note over AL: Child activities stop first
+    rect rgb(232, 245, 233)
+        Note over Stmt: SetStatementProperties
+        Stmt->>Ctx: StatementType = QUERY
+        Stmt->>Ctx: OperationType = EXECUTE_STATEMENT
+        Stmt->>Ctx: ResultFormat = CLOUDFETCH | INLINE
+        Stmt->>Ctx: IsCompressed = canDecompressLz4
+    end
 
-    AL->>MA: ProcessActivity(DownloadFiles)
-    MA->>CTX: MergeFrom(activity)
-    Note over CTX: Store chunk_details
+    rect rgb(227, 242, 253)
+        Note over Stmt: ExecuteStatementAsync
+        Stmt->>Ctx: StatementId = response.OperationId
+    end
 
-    AL->>MA: ProcessActivity(PollStatus)
-    MA->>CTX: MergeFrom(activity)
-    Note over CTX: Store operation_detail
+    rect rgb(255, 243, 224)
+        Note over Stmt: PollForResponseAsync
+        Stmt->>Ctx: PollCount = attempts
+        Stmt->>Ctx: PollLatencyMs = elapsed
+    end
 
-    Note over AL: Root activity stops last
+    rect rgb(252, 228, 236)
+        Note over Reader: ReadNextRecordBatchAsync
+        Reader->>Ctx: RecordFirstBatchReady()
+    end
 
-    AL->>MA: ProcessActivity(ExecuteQuery)
-    MA->>CTX: MergeFrom(activity)
-    Note over CTX: Store operation_latency
-
-    MA->>MA: IsRootActivity? Yes!
-    MA->>CTX: BuildProto()
-    Note over CTX: All data merged → complete proto
-    MA->>TC: Enqueue(proto)
-    MA->>MA: Remove statement context
+    rect rgb(237, 231, 246)
+        Note over Reader: Dispose
+        Reader->>Ctx: RecordResultsConsumed()
+        Reader->>Ctx: SetChunkDetails(...)
+    end
 ```
 
-#### StatementTelemetryContext: Merging Data
+#### Summary Table
+
+The `StatementTelemetryContext` is protocol-agnostic. Both Thrift and SEA backends populate the same fields at equivalent lifecycle points:
+
+**Thrift (HiveServer2) Protocol:**
+
+| Location | What Gets Set | When |
+|----------|--------------|------|
+| `DatabricksStatement.SetStatementProperties()` | `StatementType`, `ResultFormat`, `IsCompressed`, `OperationType` | Before Thrift RPC |
+| `HiveServer2Statement.ExecuteStatementAsync()` | `StatementId` (from server response) | After Thrift response |
+| `HiveServer2Connection.PollForResponseAsync()` | `PollCount`, `PollLatencyMs` | After polling completes |
+| `DatabricksCompositeReader` constructor | `FirstBatchReadyMs` (if direct results) | At reader creation |
+| `DatabricksCompositeReader.ReadNextRecordBatchAsync()` | `FirstBatchReadyMs` (if not already set) | On first non-null batch |
+| `DatabricksCompositeReader.Dispose()` | `ResultsConsumedMs`, chunk details | At reader disposal |
+| `DatabricksStatement` (on error) | `HasError`, `ErrorName`, `ErrorMessage` | In catch block |
+| `DatabricksStatement` (on complete) | `BuildTelemetryLog()` + `Enqueue()` | After reader dispose or error |
+
+**SEA (Statement Execution API) Protocol:**
+
+| Location | What Gets Set | When |
+|----------|--------------|------|
+| `SeaStatement.ExecuteAsync()` | `StatementType`, `ResultFormat`, `OperationType` | Before REST API call |
+| `SeaStatement.ExecuteAsync()` | `StatementId` (from REST response) | After REST response |
+| `SeaStatement.PollAsync()` | `PollCount`, `PollLatencyMs` | After polling completes |
+| `SeaReader` constructor | `FirstBatchReadyMs` (if inline results) | At reader creation |
+| `SeaReader.ReadNextRecordBatchAsync()` | `FirstBatchReadyMs` (if not already set) | On first non-null batch |
+| `SeaReader.Dispose()` | `ResultsConsumedMs`, chunk details | At reader disposal |
+| `SeaStatement` (on error) | `HasError`, `ErrorName`, `ErrorMessage` | In catch block |
+| `SeaStatement` (on complete) | `BuildTelemetryLog()` + `Enqueue()` | After reader dispose or error |
+
+#### Protocol-Agnostic Design
+
+The `StatementTelemetryContext` does not know or care which protocol is used. Both backends populate the same fields:
+
+```mermaid
+graph TD
+    subgraph Thrift["Thrift Protocol"]
+        TS[DatabricksStatement] --> HSS[HiveServer2Statement]
+        HSS --> HSC[HiveServer2Connection.PollForResponse]
+        TS --> TCR[DatabricksCompositeReader]
+        TCR --> CFR[CloudFetchReader]
+    end
+
+    subgraph SEA["SEA Protocol"]
+        SS[SeaStatement] --> SP[SeaStatement.PollAsync]
+        SS --> SR[SeaReader]
+    end
+
+    STC[StatementTelemetryContext<br/>protocol-agnostic]
+
+    TS -->|populates| STC
+    HSS -->|populates| STC
+    HSC -->|populates| STC
+    TCR -->|populates| STC
+    SS -->|populates| STC
+    SP -->|populates| STC
+    SR -->|populates| STC
+
+    style STC fill:#e3f2fd
+    style Thrift fill:#fff3e0
+    style SEA fill:#e8f5e9
+```
+
+#### Passing Context Through the Stack
+
+The `StatementTelemetryContext` is held on the statement and passed to protocol-specific code via method parameters:
+
+```mermaid
+graph TD
+    DS[DatabricksStatement<br/>holds: _telemetryContext] --> HSS[HiveServer2Statement<br/>receives: telemetryContext]
+    HSS --> HSC[HiveServer2Connection.PollForResponse<br/>receives: telemetryContext]
+    DS --> DCR[DatabricksCompositeReader<br/>receives: telemetryContext]
+    DCR --> CFR[CloudFetchReader<br/>receives: telemetryContext]
+    DS --> SS[SeaStatement<br/>receives: telemetryContext]
+    SS --> SR[SeaReader<br/>receives: telemetryContext]
+
+    style DS fill:#e3f2fd
+```
+
+**Key principle**: The context is a regular object passed through method parameters — no global state, no tag propagation, no listener routing. The same context works regardless of whether the statement uses Thrift or SEA protocol.
+
+#### Connection Usage (Revised)
 
 ```csharp
-internal class StatementTelemetryContext
+public sealed class DatabricksConnection : SparkHttpConnection
 {
-    // Merged from various activities
-    public string? SessionId { get; set; }
-    public string? StatementId { get; set; }
-    public long OperationLatencyMs { get; set; }
-    public StatementType StatementType { get; set; }
-    public ChunkDetails ChunkDetails { get; } = new();
-    public OperationDetail OperationDetail { get; } = new();
-    public ResultLatency ResultLatency { get; } = new();
-    public DriverErrorInfo? ErrorInfo { get; set; }
+    private ITelemetryClient? _telemetryClient;
+    private TelemetrySessionContext? _telemetrySessionContext;
 
-    /// <summary>
-    /// Merge data from an activity based on its operation name.
-    /// </summary>
-    public void MergeFrom(Activity activity)
+    protected override async Task OpenAsyncCore(CancellationToken ct)
     {
-        // Always capture IDs
-        SessionId ??= activity.GetTagItem("session.id")?.ToString();
-        StatementId ??= activity.GetTagItem("statement.id")?.ToString();
+        await base.OpenAsyncCore(ct);
 
-        switch (activity.OperationName)
+        if (_telemetryConfig.Enabled && IsTelemetryFeatureFlagEnabled())
         {
-            case "ExecuteQuery":
-            case "ExecuteUpdate":
-                MergeStatementActivity(activity);
-                break;
+            // Get shared telemetry client for this host
+            _telemetryClient = TelemetryClientManager.GetInstance()
+                .GetOrCreateClient(_host, () => CreateTelemetryExporter(), _telemetryConfig);
 
-            case "DownloadFiles":
-                MergeChunkDetails(activity);
-                break;
-
-            case "PollOperationStatus":
-                MergePollingMetrics(activity);
-                break;
-        }
-
-        // Always check for errors
-        if (activity.Status == ActivityStatusCode.Error)
-        {
-            MergeErrorInfo(activity);
+            // Build frozen session context (shared with all statements)
+            _telemetrySessionContext = BuildTelemetrySessionContext();
         }
     }
 
-    private void MergeStatementActivity(Activity activity)
+    protected override async ValueTask DisposeAsyncCore()
     {
-        OperationLatencyMs = (long)activity.Duration.TotalMilliseconds;
-        StatementType = ParseStatementType(activity);
-
-        // Extract result latency from tags
-        if (activity.GetTagItem("result.ready_latency_ms") is long readyLatency)
-            ResultLatency.ResultSetReadyLatencyMillis = readyLatency;
-    }
-
-    private void MergeChunkDetails(Activity activity)
-    {
-        // From summary tags (preferred)
-        if (activity.GetTagItem("cloudfetch.total_chunks") is int total)
-            ChunkDetails.TotalChunksPresent = total;
-        if (activity.GetTagItem("cloudfetch.initial_latency_ms") is long initial)
-            ChunkDetails.InitialChunkLatencyMillis = initial;
-        if (activity.GetTagItem("cloudfetch.slowest_latency_ms") is long slowest)
-            ChunkDetails.SlowestChunkLatencyMillis = slowest;
-
-        // Or compute from events
-        foreach (var evt in activity.Events.Where(e => e.Name == "cloudfetch.chunk_downloaded"))
+        // Flush and release shared client (decrements ref count)
+        if (_telemetryClient != null)
         {
-            ChunkDetails.TotalChunksIterated++;
-            // ... extract and aggregate
+            await TelemetryClientManager.GetInstance().ReleaseClientAsync(_host);
         }
-    }
-
-    private void MergePollingMetrics(Activity activity)
-    {
-        if (activity.GetTagItem("poll.count") is int count)
-            OperationDetail.NOperationStatusCalls = count;
-        if (activity.GetTagItem("poll.total_latency_ms") is long latency)
-            OperationDetail.OperationStatusLatencyMillis = latency;
+        await base.DisposeAsyncCore();
     }
 }
 ```
-
-#### Contracts
-
-**Multi-Activity Aggregation**:
-- Receives `ProcessActivity()` for EVERY activity (parent and children)
-- All activities for same statement share `statement_id` tag
-- Data merged incrementally into `StatementTelemetryContext`
-- Proto emitted when ROOT activity completes (all children already processed)
-
-**Session-Level Correlation**:
-- `session_id` captured from activities and included in all protos
-- Multiple statements from same connection share `session_id`
-- Allows correlation of all statements within a connection
-
-**Flush Triggers**:
-- **Root activity stops**: Emit proto immediately (all data aggregated)
-- **Connection closes**: Flush all pending contexts (via `FlushAsync`)
-- **Error in root**: Emit proto with `error_info` populated
-
-**Error Handling**:
-- Activity errors (status = Error) captured in `error_info`
-- Never throws exceptions
-- All exceptions swallowed (logged at TRACE level only)
 
 ---
 
@@ -2015,1387 +1680,30 @@ namespace AdbcDrivers.Databricks.Telemetry
 
 ## 4. Data Collection
 
-### 4.1 Tag Definition System
+> **V3 change**: The V2 tag definition system (`TelemetryTag` attribute, `TagExportScope`, `TelemetryTagRegistry`, tag filtering in `MetricsAggregator`) is removed. Telemetry data is populated directly on `StatementTelemetryContext` — see Section 3.5.
 
-To ensure maintainability and explicit control over what data is collected and exported, all Activity tags are defined in a centralized tag definition system.
+### 4.1 Tag Definition Constants (Simplified)
 
-#### Tag Definition Structure
+The `TagDefinitions/` files (`ConnectionOpenEvent.cs`, `StatementExecutionEvent.cs`, etc.) are **simplified to plain string constants** used for OpenTelemetry Activity tags. The `[TelemetryTag]` attributes, `TagExportScope` enum, and `TelemetryTagRegistry` are removed — they were only needed for Activity-based telemetry extraction.
 
-**Location**: `Telemetry/TagDefinitions/`
-
-```mermaid
-flowchart TD
-    subgraph TD["Telemetry/TagDefinitions/"]
-        TT["TelemetryTag.cs<br/><small>Tag metadata and annotations</small>"]
-        TE["TelemetryEvent.cs<br/><small>Event definitions with associated tags</small>"]
-        COE["ConnectionOpenEvent.cs<br/><small>Connection event tag definitions</small>"]
-        SEE["StatementExecutionEvent.cs<br/><small>Statement event tag definitions</small>"]
-        EE["ErrorEvent.cs<br/><small>Error event tag definitions</small>"]
-    end
-
-    style TD fill:#f5f5f5,stroke:#9e9e9e
-```
-
-#### TelemetryTag Annotation
-
-**File**: `TagDefinitions/TelemetryTag.cs`
-
+**Keep** (string constants for Activity tracing):
 ```csharp
-namespace AdbcDrivers.Databricks.Telemetry.TagDefinitions
+internal static class StatementExecutionEvent
 {
-    /// <summary>
-    /// Defines export scope for telemetry tags.
-    /// </summary>
-    [Flags]
-    internal enum TagExportScope
-    {
-        None = 0,
-        ExportLocal = 1,      // Export to local diagnostics (file listener, etc.)
-        ExportDatabricks = 2, // Export to Databricks telemetry service
-        ExportAll = ExportLocal | ExportDatabricks
-    }
-
-    /// <summary>
-    /// Attribute to annotate Activity tag definitions.
-    /// </summary>
-    [AttributeUsage(AttributeTargets.Field, AllowMultiple = false)]
-    internal sealed class TelemetryTagAttribute : Attribute
-    {
-        public string TagName { get; }
-        public TagExportScope ExportScope { get; set; }
-        public string? Description { get; set; }
-        public bool Required { get; set; }
-
-        public TelemetryTagAttribute(string tagName)
-        {
-            TagName = tagName;
-            ExportScope = TagExportScope.ExportAll;
-        }
-    }
+    public const string SessionId = "session.id";
+    public const string StatementId = "statement.id";
+    public const string ResultFormat = "result.format";
+    // ... etc
 }
 ```
 
-#### Event Tag Definitions
-
-**File**: `TagDefinitions/ConnectionOpenEvent.cs`
-
-```csharp
-namespace AdbcDrivers.Databricks.Telemetry.TagDefinitions
-{
-    /// <summary>
-    /// Tag definitions for Connection.Open events.
-    /// </summary>
-    internal static class ConnectionOpenEvent
-    {
-        public const string EventName = "Connection.Open";
-
-        // Standard tags
-        [TelemetryTag("workspace.id",
-            ExportScope = TagExportScope.ExportDatabricks,
-            Description = "Databricks workspace ID",
-            Required = true)]
-        public const string WorkspaceId = "workspace.id";
-
-        [TelemetryTag("session.id",
-            ExportScope = TagExportScope.ExportDatabricks,
-            Description = "Connection session ID",
-            Required = true)]
-        public const string SessionId = "session.id";
-
-        // Driver configuration tags
-        [TelemetryTag("driver.version",
-            ExportScope = TagExportScope.ExportAll,
-            Description = "ADBC driver version")]
-        public const string DriverVersion = "driver.version";
-
-        [TelemetryTag("driver.os",
-            ExportScope = TagExportScope.ExportAll,
-            Description = "Operating system")]
-        public const string DriverOS = "driver.os";
-
-        [TelemetryTag("driver.runtime",
-            ExportScope = TagExportScope.ExportAll,
-            Description = ".NET runtime version")]
-        public const string DriverRuntime = "driver.runtime";
-
-        // Feature flags
-        [TelemetryTag("feature.cloudfetch",
-            ExportScope = TagExportScope.ExportDatabricks,
-            Description = "CloudFetch enabled")]
-        public const string FeatureCloudFetch = "feature.cloudfetch";
-
-        [TelemetryTag("feature.lz4",
-            ExportScope = TagExportScope.ExportDatabricks,
-            Description = "LZ4 compression enabled")]
-        public const string FeatureLz4 = "feature.lz4";
-
-        // Sensitive tags - NOT exported to Databricks
-        [TelemetryTag("server.address",
-            ExportScope = TagExportScope.ExportLocal,
-            Description = "Workspace host (local diagnostics only)")]
-        public const string ServerAddress = "server.address";
-
-        /// <summary>
-        /// Get all tags that should be exported to Databricks.
-        /// </summary>
-        public static IReadOnlySet<string> GetDatabricksExportTags()
-        {
-            return new HashSet<string>
-            {
-                WorkspaceId,
-                SessionId,
-                DriverVersion,
-                DriverOS,
-                DriverRuntime,
-                FeatureCloudFetch,
-                FeatureLz4
-            };
-        }
-    }
-}
-```
-
-**File**: `TagDefinitions/StatementExecutionEvent.cs`
-
-```csharp
-namespace AdbcDrivers.Databricks.Telemetry.TagDefinitions
-{
-    /// <summary>
-    /// Tag definitions for Statement execution events.
-    /// </summary>
-    internal static class StatementExecutionEvent
-    {
-        public const string EventName = "Statement.Execute";
-
-        // Statement identification
-        [TelemetryTag("statement.id",
-            ExportScope = TagExportScope.ExportDatabricks,
-            Description = "Statement execution ID",
-            Required = true)]
-        public const string StatementId = "statement.id";
-
-        [TelemetryTag("session.id",
-            ExportScope = TagExportScope.ExportDatabricks,
-            Description = "Connection session ID",
-            Required = true)]
-        public const string SessionId = "session.id";
-
-        // Result format tags
-        [TelemetryTag("result.format",
-            ExportScope = TagExportScope.ExportDatabricks,
-            Description = "Result format: inline, cloudfetch")]
-        public const string ResultFormat = "result.format";
-
-        [TelemetryTag("result.chunk_count",
-            ExportScope = TagExportScope.ExportDatabricks,
-            Description = "Number of CloudFetch chunks")]
-        public const string ResultChunkCount = "result.chunk_count";
-
-        [TelemetryTag("result.bytes_downloaded",
-            ExportScope = TagExportScope.ExportDatabricks,
-            Description = "Total bytes downloaded")]
-        public const string ResultBytesDownloaded = "result.bytes_downloaded";
-
-        [TelemetryTag("result.compression_enabled",
-            ExportScope = TagExportScope.ExportDatabricks,
-            Description = "Compression enabled for results")]
-        public const string ResultCompressionEnabled = "result.compression_enabled";
-
-        // Polling metrics
-        [TelemetryTag("poll.count",
-            ExportScope = TagExportScope.ExportDatabricks,
-            Description = "Number of status poll requests")]
-        public const string PollCount = "poll.count";
-
-        [TelemetryTag("poll.latency_ms",
-            ExportScope = TagExportScope.ExportDatabricks,
-            Description = "Total polling latency")]
-        public const string PollLatencyMs = "poll.latency_ms";
-
-        // Chunk latency metrics (from CloudFetch download summary)
-        [TelemetryTag("chunk.initial_latency_ms",
-            ExportScope = TagExportScope.ExportDatabricks,
-            Description = "Latency of first chunk download in milliseconds")]
-        public const string ChunkInitialLatencyMs = "chunk.initial_latency_ms";
-
-        [TelemetryTag("chunk.slowest_latency_ms",
-            ExportScope = TagExportScope.ExportDatabricks,
-            Description = "Latency of slowest chunk download in milliseconds")]
-        public const string ChunkSlowestLatencyMs = "chunk.slowest_latency_ms";
-
-        // Sensitive tags - NOT exported to Databricks
-        [TelemetryTag("db.statement",
-            ExportScope = TagExportScope.ExportLocal,
-            Description = "SQL query text (local diagnostics only)")]
-        public const string DbStatement = "db.statement";
-
-        /// <summary>
-        /// Get all tags that should be exported to Databricks.
-        /// </summary>
-        public static IReadOnlySet<string> GetDatabricksExportTags()
-        {
-            return new HashSet<string>
-            {
-                StatementId,
-                SessionId,
-                ResultFormat,
-                ResultChunkCount,
-                ResultBytesDownloaded,
-                ResultCompressionEnabled,
-                PollCount,
-                PollLatencyMs,
-                ChunkInitialLatencyMs,
-                ChunkSlowestLatencyMs
-            };
-        }
-    }
-}
-```
-
-#### Tag Registry
-
-**File**: `TagDefinitions/TelemetryTagRegistry.cs`
-
-```csharp
-namespace AdbcDrivers.Databricks.Telemetry.TagDefinitions
-{
-    /// <summary>
-    /// Central registry for all telemetry tags and events.
-    /// </summary>
-    internal static class TelemetryTagRegistry
-    {
-        /// <summary>
-        /// Get all tags allowed for Databricks export by event type.
-        /// </summary>
-        public static IReadOnlySet<string> GetDatabricksExportTags(TelemetryEventType eventType)
-        {
-            return eventType switch
-            {
-                TelemetryEventType.ConnectionOpen => ConnectionOpenEvent.GetDatabricksExportTags(),
-                TelemetryEventType.StatementExecution => StatementExecutionEvent.GetDatabricksExportTags(),
-                TelemetryEventType.Error => ErrorEvent.GetDatabricksExportTags(),
-                _ => new HashSet<string>()
-            };
-        }
-
-        /// <summary>
-        /// Check if a tag should be exported to Databricks for a given event type.
-        /// </summary>
-        public static bool ShouldExportToDatabricks(TelemetryEventType eventType, string tagName)
-        {
-            var allowedTags = GetDatabricksExportTags(eventType);
-            return allowedTags.Contains(tagName);
-        }
-    }
-}
-```
-
-#### Usage in Activity Tag Filtering
-
-The `MetricsAggregator` uses the tag registry for filtering:
-
-```csharp
-private TelemetryMetric ProcessActivity(Activity activity)
-{
-    var eventType = DetermineEventType(activity);
-    var metric = new TelemetryMetric
-    {
-        EventType = eventType,
-        Timestamp = activity.StartTimeUtc
-    };
-
-    // Filter tags using the registry
-    foreach (var tag in activity.Tags)
-    {
-        if (TelemetryTagRegistry.ShouldExportToDatabricks(eventType, tag.Key))
-        {
-            // Export this tag
-            SetMetricProperty(metric, tag.Key, tag.Value);
-        }
-        // Tags not in registry are silently dropped
-    }
-
-    return metric;
-}
-```
-
-#### Benefits
-
-1. **Centralized Control**: All tags defined in one place
-2. **Explicit Export Scope**: Clear annotation of what goes where
-3. **Type Safety**: Constants prevent typos
-4. **Self-Documenting**: Descriptions embedded in code
-5. **Easy Auditing**: Simple to review what data is exported
-6. **Future-Proof**: New tags just require adding to definition files
-
-### 4.2 Activity Tags by Event Type
-
-#### Activity Operation Name to MetricType Mapping
-
-The `ActivityListener` maps Activity operation names to Databricks `TelemetryEventType` enum:
-
-| Activity Operation Name | TelemetryEventType | Notes |
-|------------------------|-------------------|-------|
-| `Connection.Open` | `ConnectionOpen` | Emitted immediately when connection opens |
-| `Connection.OpenAsync` | `ConnectionOpen` | Same as above |
-| `Statement.Execute` | `StatementExecution` | Main statement execution activity |
-| `Statement.ExecuteQuery` | `StatementExecution` | Query execution variant |
-| `Statement.ExecuteUpdate` | `StatementExecution` | Update execution variant |
-| `CloudFetch.Download` | _(aggregated into parent)_ | Child activity, metrics rolled up to statement |
-| `CloudFetch.ChunkDownload` | _(aggregated into parent)_ | Child activity, metrics rolled up to statement |
-| `Results.Fetch` | _(aggregated into parent)_ | Child activity, metrics rolled up to statement |
-| _(any activity with `error.type` tag)_ | `Error` | Error events based on tag presence |
-
-**Mapping Logic** (in `MetricsAggregator`):
-```csharp
-private TelemetryEventType DetermineEventType(Activity activity)
-{
-    // Check for errors first
-    if (activity.GetTagItem("error.type") != null)
-        return TelemetryEventType.Error;
-
-    // Map based on operation name
-    var operationName = activity.OperationName;
-    if (operationName.StartsWith("Connection."))
-        return TelemetryEventType.ConnectionOpen;
-
-    if (operationName.StartsWith("Statement."))
-        return TelemetryEventType.StatementExecution;
-
-    // Default for unknown operations
-    return TelemetryEventType.StatementExecution;
-}
-```
-
-**New Tags for Metrics** (add to existing activities):
-- `result.format`: "inline" | "cloudfetch"
-- `result.chunk_count`: Number of CloudFetch chunks
-- `result.bytes_downloaded`: Total bytes downloaded
-- `result.compression_enabled`: true/false
-- `poll.count`: Number of status poll requests
-- `poll.latency_ms`: Total polling latency
-
-**Driver Configuration Tags** (Connection.Open activity):
-- `driver.version`: Driver version string
-- `driver.os`: Operating system
-- `driver.runtime`: .NET runtime version
-- `feature.cloudfetch`: CloudFetch enabled?
-- `feature.lz4`: LZ4 decompression enabled?
-- `feature.direct_results`: Direct results enabled?
-
-### 4.2 Activity Events for Fine-Grained Data
-
-Use `Activity.AddEvent()` for per-chunk metrics:
-
-```csharp
-activity?.AddEvent(new ActivityEvent("CloudFetch.ChunkDownloaded",
-    tags: new ActivityTagsCollection
-    {
-        { "chunk.index", chunkIndex },
-        { "chunk.latency_ms", latency.TotalMilliseconds },
-        { "chunk.bytes", bytesDownloaded },
-        { "chunk.compressed", compressed }
-    }));
-```
-
-### 4.3 Collection Points
-
-```mermaid
-graph LR
-    A[Connection.OpenAsync] -->|Activity + Tags| B[Listener]
-    C[Statement.ExecuteAsync] -->|Activity + Tags| B
-    D[CloudFetch.Download] -->|Activity.AddEvent| B
-    E[Statement.GetResults] -->|Activity + Tags| B
-
-    B --> F[MetricsAggregator]
-```
-
-**Key Point**: No new instrumentation code! Just add tags to existing activities.
-
-### 4.4 Comprehensive Proto Field Population Guide
-
-This section provides detailed documentation on how every field in the `OssSqlDriverTelemetryLog` proto schema should be populated. The `MetricsAggregator` is responsible for collecting data from Activity tags and converting them to the proto structure.
-
-#### 4.4.1 Proto Schema Overview
-
-The telemetry data is serialized using the proto schema defined in `Telemetry/Proto/sql_driver_telemetry.proto`. The main message is `OssSqlDriverTelemetryLog`:
-
-```protobuf
-message OssSqlDriverTelemetryLog {
-  string session_id = 1;
-  string sql_statement_id = 2;
-  DriverSystemConfiguration system_configuration = 3;
-  DriverConnectionParameters driver_connection_params = 4;
-  string auth_type = 5;
-  VolumeOperationEvent vol_operation = 6;
-  SqlExecutionEvent sql_operation = 7;
-  DriverErrorInfo error_info = 8;
-  int64 operation_latency_ms = 9;
-}
-```
-
----
-
-#### 4.4.2 Root-Level Fields (OssSqlDriverTelemetryLog)
-
-| Proto Field | Activity Tag | Data Source | Calculation/Notes |
-|-------------|--------------|-------------|-------------------|
-| `session_id` | `session.id` | `DatabricksConnection` | Thrift session handle converted to string. Set in `HandleOpenSessionResponse()`. |
-| `sql_statement_id` | `statement.id` | `DatabricksStatement` | Thrift operation handle GUID. Set when statement execution starts. |
-| `auth_type` | `auth.type` | `DatabricksConnection` | Authentication type string. See [Auth Type Mapping](#auth-type-mapping). |
-| `operation_latency_ms` | `activity.Duration` | Activity infrastructure | `(long)activity.Duration.TotalMilliseconds` |
-
-**Auth Type Mapping**:
-
-| Authentication Method | `auth_type` Value |
-|----------------------|-------------------|
-| Personal Access Token | `"pat"` |
-| OAuth Client Credentials (M2M) | `"oauth-m2m"` |
-| OAuth with Token Exchange | `"oauth-token-exchange"` |
-| OAuth Browser-Based | `"oauth-browser"` |
-| Azure Managed Identity | `"azure-msi"` |
-| GCP Service Account | `"gcp-service-account"` |
-
-**Activity Tag to Set** (in `DatabricksConnection.OpenAsync()`):
-```csharp
-activity?.SetTag("auth.type", DetermineAuthType());
-
-private string DetermineAuthType()
-{
-    if (Properties.TryGetValue(SparkParameters.Token, out _))
-        return "pat";
-    if (Properties.TryGetValue(DatabricksParameters.ClientId, out _))
-        return "oauth-m2m";
-    // ... other auth type detection
-    return "unknown";
-}
-```
-
----
-
-#### 4.4.3 DriverSystemConfiguration (Complete Field Mapping)
-
-This message captures driver and system environment information. All fields should be populated from the Connection.Open activity.
-
-```mermaid
-flowchart LR
-    A[System APIs] --> B[Activity Tags]
-    B --> C[MetricsAggregator]
-    C --> D[DriverSystemConfiguration Proto]
-
-    subgraph "System APIs"
-        A1[RuntimeInformation]
-        A2[Environment]
-        A3[Assembly.GetExecutingAssembly]
-        A4[CultureInfo]
-    end
-```
-
-| Proto Field | Activity Tag | Data Source | Calculation |
-|-------------|--------------|-------------|-------------|
-| `driver_name` | _(hardcoded)_ | - | `"Databricks ADBC Driver"` |
-| `driver_version` | `driver.version` | `ApacheUtility.GetAssemblyVersion()` | Already implemented. Returns assembly version string. |
-| `runtime_name` | `runtime.name` | `RuntimeInformation.FrameworkDescription` | Extract runtime name (e.g., ".NET", ".NET Framework", ".NET Core") |
-| `runtime_version` | `runtime.version` | `RuntimeInformation.FrameworkDescription` | Extract version number (e.g., "8.0.0", "4.7.2") |
-| `runtime_vendor` | `runtime.vendor` | _(hardcoded)_ | `"Microsoft"` for .NET |
-| `os_name` | `os.name` | `RuntimeInformation.OSDescription` | Full OS description string |
-| `os_version` | `os.version` | `Environment.OSVersion.Version.ToString()` | OS version number |
-| `os_arch` | `os.arch` | `RuntimeInformation.ProcessArchitecture.ToString()` | "X64", "X86", "Arm64", etc. |
-| `client_app_name` | `client.app_name` | Connection properties | From `UserApplicationName` parameter or User-Agent header |
-| `locale_name` | `locale.name` | `CultureInfo.CurrentCulture.Name` | e.g., "en-US", "de-DE" |
-| `char_set_encoding` | `char_set_encoding` | `Encoding.Default.WebName` | e.g., "utf-8" |
-| `process_name` | `process.name` | `Process.GetCurrentProcess().ProcessName` | Calling application process name |
-
-**Implementation - Setting Activity Tags** (in `DatabricksConnection.CreateSessionRequest()`):
-
-```csharp
-// Add to existing activity tag setting in CreateSessionRequest()
-private void SetSystemConfigurationTags(Activity? activity)
-{
-    if (activity == null) return;
-
-    // Driver info (already exists)
-    activity.SetTag("driver.version", s_assemblyVersion);
-    activity.SetTag("driver.name", "Databricks ADBC Driver");
-
-    // Runtime info
-    var frameworkDescription = RuntimeInformation.FrameworkDescription;
-    activity.SetTag("runtime.name", ExtractRuntimeName(frameworkDescription));
-    activity.SetTag("runtime.version", ExtractRuntimeVersion(frameworkDescription));
-    activity.SetTag("runtime.vendor", "Microsoft");
-
-    // OS info
-    activity.SetTag("os.name", RuntimeInformation.OSDescription);
-    activity.SetTag("os.version", Environment.OSVersion.Version.ToString());
-    activity.SetTag("os.arch", RuntimeInformation.ProcessArchitecture.ToString());
-
-    // Client info
-    activity.SetTag("client.app_name", GetClientAppName());
-    activity.SetTag("locale.name", CultureInfo.CurrentCulture.Name);
-    activity.SetTag("char_set_encoding", Encoding.Default.WebName);
-    activity.SetTag("process.name", GetProcessName());
-}
-
-private static string ExtractRuntimeName(string frameworkDescription)
-{
-    // ".NET 8.0.0" -> ".NET"
-    // ".NET Framework 4.7.2" -> ".NET Framework"
-    // ".NET Core 3.1.0" -> ".NET Core"
-    var match = Regex.Match(frameworkDescription, @"^(\.NET[^\d]*)");
-    return match.Success ? match.Groups[1].Value.Trim() : ".NET";
-}
-
-private static string ExtractRuntimeVersion(string frameworkDescription)
-{
-    // ".NET 8.0.0" -> "8.0.0"
-    var match = Regex.Match(frameworkDescription, @"(\d+\.\d+\.?\d*)");
-    return match.Success ? match.Value : "unknown";
-}
-
-private string GetClientAppName()
-{
-    // Priority: connection property > User-Agent > process name
-    if (Properties.TryGetValue("UserApplicationName", out var appName))
-        return appName;
-    return GetProcessName();
-}
-
-private static string GetProcessName()
-{
-    try
-    {
-        return Process.GetCurrentProcess().ProcessName;
-    }
-    catch
-    {
-        return "unknown";
-    }
-}
-```
-
-**MetricsAggregator Implementation**:
-
-```csharp
-private static DriverSystemConfiguration ExtractSystemConfiguration(Activity activity)
-{
-    return new DriverSystemConfiguration
-    {
-        DriverName = "Databricks ADBC Driver",
-        DriverVersion = GetTagValue(activity, "driver.version") ?? string.Empty,
-        RuntimeName = GetTagValue(activity, "runtime.name") ?? ".NET",
-        RuntimeVersion = GetTagValue(activity, "runtime.version") ?? string.Empty,
-        RuntimeVendor = GetTagValue(activity, "runtime.vendor") ?? "Microsoft",
-        OsName = GetTagValue(activity, "os.name") ?? string.Empty,
-        OsVersion = GetTagValue(activity, "os.version") ?? string.Empty,
-        OsArch = GetTagValue(activity, "os.arch") ?? string.Empty,
-        ClientAppName = GetTagValue(activity, "client.app_name") ?? string.Empty,
-        LocaleName = GetTagValue(activity, "locale.name") ?? string.Empty,
-        CharSetEncoding = GetTagValue(activity, "char_set_encoding") ?? "utf-8",
-        ProcessName = GetTagValue(activity, "process.name") ?? string.Empty
-    };
-}
-```
-
----
-
-#### 4.4.4 DriverConnectionParameters (Complete Field Mapping)
-
-This message captures connection configuration. Fields are populated from `DatabricksConnection` properties during connection open.
-
-| Proto Field | Activity Tag | Data Source | Calculation |
-|-------------|--------------|-------------|-------------|
-| `http_path` | `connection.http_path` | `Properties[SparkParameters.HttpPath]` | HTTP path for API calls |
-| `mode` | `connection.mode` | `Properties[DatabricksParameters.Protocol]` | See [DriverModeType Mapping](#drivermodetype-mapping) |
-| `host_info.host_url` | `connection.host` | `Properties[SparkParameters.HostName]` | Base URL without protocol |
-| `host_info.port` | `connection.port` | `Properties[SparkParameters.Port]` | Port number (default: 443) |
-| `use_proxy` | `connection.use_proxy` | Proxy configuration | `true` if proxy is configured |
-| `auth_mech` | `connection.auth_mech` | Authentication config | See [DriverAuthMechType Mapping](#driverauthmechtype-mapping) |
-| `auth_flow` | `connection.auth_flow` | Authentication config | See [DriverAuthFlowType Mapping](#driverauthflowtype-mapping) |
-| `auth_scope` | `connection.auth_scope` | `Properties["OAuthScope"]` | OAuth scope if applicable |
-| `enable_arrow` | `feature.arrow` | _(always true)_ | ADBC always uses Arrow |
-| `enable_direct_results` | `feature.direct_results` | `Properties[DatabricksParameters.EnableDirectResults]` | Boolean |
-| `rows_fetched_per_block` | `connection.batch_size` | `Properties[SparkParameters.BatchSize]` | Default: 2,000,000 |
-| `async_poll_interval_millis` | `connection.poll_interval_ms` | `Properties[DatabricksParameters.AsyncPollIntervalMillis]` | Default: 100ms |
-| `socket_timeout` | `connection.socket_timeout` | `Properties[SparkParameters.SocketTimeout]` | Socket timeout in seconds |
-| `auto_commit` | `connection.auto_commit` | Connection state | Auto-commit mode setting |
-| `enable_complex_datatype_support` | `feature.complex_types` | `Properties["EnableComplexTypes"]` | Complex type support |
-
-**DriverModeType Mapping**:
-
-| Connection Protocol | Proto Enum Value |
-|--------------------|------------------|
-| `"thrift"` | `DRIVER_MODE_THRIFT` |
-| `"sea"` | `DRIVER_MODE_SEA` |
-| _(other)_ | `DRIVER_MODE_TYPE_UNSPECIFIED` |
-
-**DriverAuthMechType Mapping**:
-
-| Authentication Type | Proto Enum Value |
-|--------------------|------------------|
-| PAT (Personal Access Token) | `DRIVER_AUTH_MECH_PAT` |
-| OAuth (any flow) | `DRIVER_AUTH_MECH_OAUTH` |
-| Other | `DRIVER_AUTH_MECH_OTHER` |
-
-**DriverAuthFlowType Mapping**:
-
-| OAuth Flow | Proto Enum Value |
-|------------|------------------|
-| Token passthrough | `DRIVER_AUTH_FLOW_TOKEN_PASSTHROUGH` |
-| Client credentials (M2M) | `DRIVER_AUTH_FLOW_CLIENT_CREDENTIALS` |
-| Browser-based | `DRIVER_AUTH_FLOW_BROWSER_BASED_AUTHENTICATION` |
-
-**Implementation - Setting Activity Tags** (in `DatabricksConnection.HandleOpenSessionResponse()`):
-
-```csharp
-private void SetConnectionParameterTags(Activity? activity)
-{
-    if (activity == null) return;
-
-    // Basic connection info
-    activity.SetTag("connection.http_path", Properties.GetValueOrDefault(SparkParameters.HttpPath, ""));
-    activity.SetTag("connection.host", _host);
-    activity.SetTag("connection.port", Properties.GetValueOrDefault(SparkParameters.Port, "443"));
-    activity.SetTag("connection.mode", DetermineDriverMode());
-
-    // Auth configuration
-    activity.SetTag("connection.auth_mech", DetermineAuthMech());
-    activity.SetTag("connection.auth_flow", DetermineAuthFlow());
-    if (Properties.TryGetValue("OAuthScope", out var scope))
-        activity.SetTag("connection.auth_scope", scope);
-
-    // Feature flags
-    activity.SetTag("feature.arrow", true);
-    activity.SetTag("feature.direct_results", _enableDirectResults);
-    activity.SetTag("feature.cloudfetch", _useCloudFetch);
-    activity.SetTag("feature.lz4", _canDecompressLz4);
-    activity.SetTag("feature.complex_types", _enableComplexTypes);
-
-    // Performance settings
-    activity.SetTag("connection.batch_size", _batchSize);
-    activity.SetTag("connection.poll_interval_ms", _asyncPollIntervalMs);
-
-    // Proxy (only flag, no sensitive details)
-    activity.SetTag("connection.use_proxy", _proxyConfigurator != null);
-}
-
-private string DetermineDriverMode()
-{
-    if (Properties.TryGetValue(DatabricksParameters.Protocol, out var protocol))
-    {
-        return protocol.ToLowerInvariant() switch
-        {
-            "sea" => "sea",
-            _ => "thrift"
-        };
-    }
-    return "thrift";
-}
-
-private string DetermineAuthMech()
-{
-    if (Properties.ContainsKey(SparkParameters.Token))
-        return "pat";
-    if (Properties.ContainsKey(DatabricksParameters.ClientId))
-        return "oauth";
-    return "other";
-}
-
-private string DetermineAuthFlow()
-{
-    if (Properties.ContainsKey(SparkParameters.Token))
-        return "token_passthrough";
-    if (Properties.ContainsKey(DatabricksParameters.ClientId))
-        return "client_credentials";
-    return "unspecified";
-}
-```
-
-**MetricsAggregator Implementation**:
-
-```csharp
-private static DriverConnectionParameters ExtractConnectionParameters(Activity activity)
-{
-    var parameters = new DriverConnectionParameters
-    {
-        HttpPath = GetTagValue(activity, "connection.http_path") ?? string.Empty,
-        Mode = ParseDriverMode(GetTagValue(activity, "connection.mode")),
-        HostInfo = new HostDetails
-        {
-            HostUrl = GetTagValue(activity, "connection.host") ?? string.Empty,
-            Port = GetTagValueInt(activity, "connection.port", 443)
-        },
-        UseProxy = GetTagValueBool(activity, "connection.use_proxy"),
-        AuthMech = ParseAuthMech(GetTagValue(activity, "connection.auth_mech")),
-        AuthFlow = ParseAuthFlow(GetTagValue(activity, "connection.auth_flow")),
-        AuthScope = GetTagValue(activity, "connection.auth_scope") ?? string.Empty,
-        EnableArrow = GetTagValueBool(activity, "feature.arrow", defaultValue: true),
-        EnableDirectResults = GetTagValueBool(activity, "feature.direct_results"),
-        RowsFetchedPerBlock = GetTagValueLong(activity, "connection.batch_size", 2000000),
-        AsyncPollIntervalMillis = GetTagValueLong(activity, "connection.poll_interval_ms", 100)
-    };
-
-    return parameters;
-}
-
-private static DriverModeType ParseDriverMode(string? mode)
-{
-    return mode?.ToLowerInvariant() switch
-    {
-        "thrift" => DriverModeType.DriverModeThrift,
-        "sea" => DriverModeType.DriverModeSea,
-        _ => DriverModeType.DriverModeTypeUnspecified
-    };
-}
-
-private static DriverAuthMechType ParseAuthMech(string? mech)
-{
-    return mech?.ToLowerInvariant() switch
-    {
-        "pat" => DriverAuthMechType.DriverAuthMechPat,
-        "oauth" => DriverAuthMechType.DriverAuthMechOauth,
-        _ => DriverAuthMechType.DriverAuthMechOther
-    };
-}
-
-private static DriverAuthFlowType ParseAuthFlow(string? flow)
-{
-    return flow?.ToLowerInvariant() switch
-    {
-        "token_passthrough" => DriverAuthFlowType.DriverAuthFlowTokenPassthrough,
-        "client_credentials" => DriverAuthFlowType.DriverAuthFlowClientCredentials,
-        "browser" or "browser_based" => DriverAuthFlowType.DriverAuthFlowBrowserBasedAuthentication,
-        _ => DriverAuthFlowType.DriverAuthFlowTypeUnspecified
-    };
-}
-```
-
----
-
-#### 4.4.5 SqlExecutionEvent (Complete Field Mapping)
-
-This message captures statement execution metrics. Data is collected from statement activities and CloudFetch events.
-
-```mermaid
-flowchart TD
-    A[Statement.Execute Activity] --> B[MetricsAggregator]
-    C[CloudFetch.Download Activity] --> B
-    D[cloudfetch.download_summary Event] --> B
-    E[OperationStatus Polling] --> B
-
-    B --> F[StatementTelemetryContext]
-    F --> G[SqlExecutionEvent Proto]
-
-    subgraph "Nested Messages"
-        G --> H[ChunkDetails]
-        G --> I[ResultLatency]
-        G --> J[OperationDetail]
-    end
-```
-
-| Proto Field | Activity Tag/Event | Data Source | Calculation |
-|-------------|-------------------|-------------|-------------|
-| `statement_type` | `statement.type` | `DatabricksStatement` | See [StatementType Mapping](#statementtype-mapping) |
-| `is_compressed` | `result.compression_enabled` | CloudFetch response | `true` if LZ4 compression used |
-| `execution_result` | `result.format` | Result handling | See [ExecutionResultFormat Mapping](#executionresultformat-mapping) |
-| `chunk_id` | `chunk.id` | CloudFetch download | Only set for chunk-specific error events |
-| `retry_count` | `retry.count` | Retry logic | Number of retry attempts made |
-
-**StatementType Mapping**:
-
-| Operation | Proto Enum Value | Determination |
-|-----------|------------------|---------------|
-| `ExecuteQuery()` | `STATEMENT_QUERY` | Returns result set |
-| `ExecuteUpdate()` | `STATEMENT_UPDATE` | Returns affected rows |
-| Catalog operations | `STATEMENT_METADATA` | GetTables, GetColumns, etc. |
-| General SQL | `STATEMENT_SQL` | Other SQL execution |
-
-**ExecutionResultFormat Mapping**:
-
-| Result Mode | Proto Enum Value | Determination |
-|-------------|------------------|---------------|
-| CloudFetch | `EXECUTION_RESULT_EXTERNAL_LINKS` | Results fetched from cloud storage |
-| Inline Arrow | `EXECUTION_RESULT_INLINE_ARROW` | Results returned inline in Arrow format |
-| Inline JSON | `EXECUTION_RESULT_INLINE_JSON` | Results returned inline as JSON |
-| Columnar Inline | `EXECUTION_RESULT_COLUMNAR_INLINE` | Columnar format inline |
-
-**Implementation - Setting Activity Tags** (in `DatabricksStatement`):
-
-```csharp
-// In ExecuteQueryAsync or similar
-private void SetStatementExecutionTags(Activity? activity, string statementType)
-{
-    if (activity == null) return;
-
-    activity.SetTag("statement.id", _operationHandle?.ToString() ?? Guid.NewGuid().ToString());
-    activity.SetTag("session.id", _connection.SessionId);
-    activity.SetTag("statement.type", statementType);
-}
-
-// In result handling (after determining result format)
-private void SetResultFormatTags(Activity? activity, bool isCloudFetch, bool isCompressed)
-{
-    if (activity == null) return;
-
-    activity.SetTag("result.format", isCloudFetch ? "cloudfetch" : "inline_arrow");
-    activity.SetTag("result.compression_enabled", isCompressed);
-}
-```
-
----
-
-#### 4.4.6 ChunkDetails (Complete Field Mapping)
-
-This nested message captures CloudFetch chunk download metrics.
-
-| Proto Field | Activity Event Field | Data Source | Calculation |
-|-------------|---------------------|-------------|-------------|
-| `initial_chunk_latency_millis` | `initial_chunk_latency_ms` | `CloudFetchDownloader` | Time to download first chunk (ms) |
-| `slowest_chunk_latency_millis` | `slowest_chunk_latency_ms` | `CloudFetchDownloader` | Maximum chunk download time (ms) |
-| `total_chunks_present` | `total_files` | `CloudFetchDownloader` | Total number of chunks from server |
-| `total_chunks_iterated` | `successful_downloads` | `CloudFetchDownloader` | Number of chunks actually consumed |
-| `sum_chunks_download_time_millis` | `total_time_ms` | `CloudFetchDownloader` | Total download time for all chunks (ms) |
-
-**Data Collection in CloudFetchDownloader**:
-
-```csharp
-// In CloudFetchDownloader - fields for tracking
-private long _initialChunkLatencyMs = -1;
-private long _slowestChunkLatencyMs = 0;
-private long _totalDownloadTimeMs = 0;
-private int _successfulDownloads = 0;
-private readonly object _metricsLock = new object();
-
-// After each chunk download completes:
-private void RecordChunkDownloadMetrics(long downloadLatencyMs)
-{
-    lock (_metricsLock)
-    {
-        // Track first chunk latency (only set once)
-        if (_initialChunkLatencyMs < 0)
-        {
-            _initialChunkLatencyMs = downloadLatencyMs;
-        }
-
-        // Track max latency for slowest chunk
-        if (downloadLatencyMs > _slowestChunkLatencyMs)
-        {
-            _slowestChunkLatencyMs = downloadLatencyMs;
-        }
-
-        // Accumulate total download time
-        _totalDownloadTimeMs += downloadLatencyMs;
-        _successfulDownloads++;
-    }
-}
-
-// Emit summary event when download completes:
-private void EmitDownloadSummaryEvent(Activity? activity)
-{
-    if (activity == null) return;
-
-    activity.AddEvent(new ActivityEvent("cloudfetch.download_summary",
-        tags: new ActivityTagsCollection
-        {
-            { "total_files", _totalChunks },
-            { "successful_downloads", _successfulDownloads },
-            { "failed_downloads", _failedDownloads },
-            { "total_bytes", _totalBytesDownloaded },
-            { "total_time_ms", _totalDownloadTimeMs },
-            { "initial_chunk_latency_ms", _initialChunkLatencyMs > 0 ? _initialChunkLatencyMs : 0 },
-            { "slowest_chunk_latency_ms", _slowestChunkLatencyMs }
-        }));
-}
-```
-
-**MetricsAggregator Processing**:
-
-```csharp
-private void ProcessCloudFetchSummaryEvent(ActivityEvent evt, StatementTelemetryContext context)
-{
-    foreach (var tag in evt.Tags)
-    {
-        switch (tag.Key)
-        {
-            case "total_files":
-                context.TotalChunksPresent = Convert.ToInt32(tag.Value);
-                break;
-            case "successful_downloads":
-                context.TotalChunksIterated = Convert.ToInt32(tag.Value);
-                break;
-            case "total_time_ms":
-                context.SumChunksDownloadTimeMs = Convert.ToInt64(tag.Value);
-                break;
-            case "initial_chunk_latency_ms":
-                context.InitialChunkLatencyMs = Convert.ToInt64(tag.Value);
-                break;
-            case "slowest_chunk_latency_ms":
-                context.SlowestChunkLatencyMs = Convert.ToInt64(tag.Value);
-                break;
-        }
-    }
-}
-
-private ChunkDetails CreateChunkDetails(StatementTelemetryContext context)
-{
-    return new ChunkDetails
-    {
-        InitialChunkLatencyMillis = context.InitialChunkLatencyMs ?? 0,
-        SlowestChunkLatencyMillis = context.SlowestChunkLatencyMs ?? 0,
-        TotalChunksPresent = context.TotalChunksPresent ?? 0,
-        TotalChunksIterated = context.TotalChunksIterated ?? 0,
-        SumChunksDownloadTimeMillis = context.SumChunksDownloadTimeMs ?? 0
-    };
-}
-```
-
----
-
-#### 4.4.7 ResultLatency (Complete Field Mapping)
-
-This nested message captures timing metrics for result set processing.
-
-| Proto Field | Activity Tag | Data Source | Calculation |
-|-------------|--------------|-------------|-------------|
-| `result_set_ready_latency_millis` | `result.ready_latency_ms` | Statement execution | Time from execute to first row available (ms) |
-| `result_set_consumption_latency_millis` | `result.consumption_latency_ms` | Reader iteration | Time from first row to last row consumed (ms) |
-
-**Data Collection Strategy**:
-
-```mermaid
-sequenceDiagram
-    participant App as Application
-    participant Stmt as Statement
-    participant Reader as Reader
-
-    App->>Stmt: ExecuteQueryAsync()
-    Note over Stmt: Start timer T1
-    Stmt->>Stmt: Execute SQL
-    Stmt->>Reader: Create Reader
-    Note over Reader: T2 = First row ready
-    Note over Reader: result_set_ready = T2 - T1
-
-    Reader->>App: First batch
-    App->>Reader: Read more...
-    Reader->>App: Last batch
-    Note over Reader: T3 = Last row consumed
-    Note over Reader: result_set_consumption = T3 - T2
-```
-
-**Implementation**:
-
-```csharp
-// In DatabricksStatement - track execution timing
-private Stopwatch _executionStopwatch = new();
-private long _resultReadyLatencyMs;
-
-public async Task<IArrowArrayStream> ExecuteQueryAsync()
-{
-    _executionStopwatch.Restart();
-
-    // ... execute SQL ...
-
-    // Record when result is ready (before creating reader)
-    _resultReadyLatencyMs = _executionStopwatch.ElapsedMilliseconds;
-
-    // Create reader
-    var reader = CreateReader();
-
-    // Set tag
-    Activity.Current?.SetTag("result.ready_latency_ms", _resultReadyLatencyMs);
-
-    return reader;
-}
-
-// In DatabricksReader - track consumption timing
-private Stopwatch _consumptionStopwatch;
-private bool _firstBatchRead = false;
-
-public override async ValueTask<RecordBatch?> ReadNextRecordBatchAsync()
-{
-    if (!_firstBatchRead)
-    {
-        _consumptionStopwatch = Stopwatch.StartNew();
-        _firstBatchRead = true;
-    }
-
-    var batch = await base.ReadNextRecordBatchAsync();
-
-    // If last batch, record consumption time
-    if (batch == null && _consumptionStopwatch != null)
-    {
-        Activity.Current?.SetTag("result.consumption_latency_ms",
-            _consumptionStopwatch.ElapsedMilliseconds);
-    }
-
-    return batch;
-}
-```
-
-**MetricsAggregator Processing**:
-
-```csharp
-private ResultLatency CreateResultLatency(StatementTelemetryContext context)
-{
-    return new ResultLatency
-    {
-        ResultSetReadyLatencyMillis = context.ResultReadyLatencyMs ?? 0,
-        ResultSetConsumptionLatencyMillis = context.ResultConsumptionLatencyMs ?? 0
-    };
-}
-```
-
----
-
-#### 4.4.8 OperationDetail (Complete Field Mapping)
-
-This nested message captures operation polling and type information.
-
-| Proto Field | Activity Tag | Data Source | Calculation |
-|-------------|--------------|-------------|-------------|
-| `n_operation_status_calls` | `poll.count` | `DatabricksOperationStatusPoller` | Number of GetOperationStatus calls |
-| `operation_status_latency_millis` | `poll.latency_ms` | `DatabricksOperationStatusPoller` | Sum of all poll latencies (ms) |
-| `operation_type` | `operation.type` | Statement/Catalog operation | See [OperationType Mapping](#operationtype-mapping) |
-| `is_internal_call` | `operation.is_internal` | Driver internals | `true` for metadata queries, etc. |
-
-**OperationType Mapping**:
-
-| Driver Operation | Proto Enum Value |
-|-----------------|------------------|
-| `OpenSession` | `OPERATION_CREATE_SESSION` |
-| `CloseSession` | `OPERATION_DELETE_SESSION` |
-| `ExecuteStatement` | `OPERATION_EXECUTE_STATEMENT` |
-| `ExecuteStatementAsync` | `OPERATION_EXECUTE_STATEMENT_ASYNC` |
-| `CloseOperation` | `OPERATION_CLOSE_STATEMENT` |
-| `CancelOperation` | `OPERATION_CANCEL_STATEMENT` |
-| `GetTypeInfo` | `OPERATION_LIST_TYPE_INFO` |
-| `GetCatalogs` | `OPERATION_LIST_CATALOGS` |
-| `GetSchemas` | `OPERATION_LIST_SCHEMAS` |
-| `GetTables` | `OPERATION_LIST_TABLES` |
-| `GetTableTypes` | `OPERATION_LIST_TABLE_TYPES` |
-| `GetColumns` | `OPERATION_LIST_COLUMNS` |
-| `GetFunctions` | `OPERATION_LIST_FUNCTIONS` |
-| `GetPrimaryKeys` | `OPERATION_LIST_PRIMARY_KEYS` |
-| `GetImportedKeys` | `OPERATION_LIST_IMPORTED_KEYS` |
-| `GetExportedKeys` | `OPERATION_LIST_EXPORTED_KEYS` |
-| `GetCrossReference` | `OPERATION_LIST_CROSS_REFERENCES` |
-
-**Data Collection in DatabricksOperationStatusPoller**:
-
-```csharp
-// In DatabricksOperationStatusPoller
-private int _pollCount = 0;
-private long _totalPollLatencyMs = 0;
-private readonly object _pollMetricsLock = new object();
-
-public async Task<TGetOperationStatusResp> PollForCompletionAsync(
-    TOperationHandle operationHandle,
-    CancellationToken cancellationToken)
-{
-    while (!IsComplete)
-    {
-        var stopwatch = Stopwatch.StartNew();
-
-        var status = await GetOperationStatusAsync(operationHandle, cancellationToken);
-
-        lock (_pollMetricsLock)
-        {
-            _pollCount++;
-            _totalPollLatencyMs += stopwatch.ElapsedMilliseconds;
-        }
-
-        // ... check status and wait ...
-    }
-
-    // Emit metrics
-    EmitPollMetrics();
-}
-
-private void EmitPollMetrics()
-{
-    Activity.Current?.SetTag("poll.count", _pollCount);
-    Activity.Current?.SetTag("poll.latency_ms", _totalPollLatencyMs);
-}
-```
-
-**MetricsAggregator Processing**:
-
-```csharp
-private OperationDetail CreateOperationDetail(StatementTelemetryContext context)
-{
-    return new OperationDetail
-    {
-        NOperationStatusCalls = context.PollCount ?? 0,
-        OperationStatusLatencyMillis = context.PollLatencyMs ?? 0,
-        OperationType = context.OperationType ?? OperationType.OperationTypeUnspecified,
-        IsInternalCall = context.IsInternalCall ?? false
-    };
-}
-```
-
----
-
-#### 4.4.9 DriverErrorInfo (Complete Field Mapping)
-
-This message captures error information when operations fail.
-
-| Proto Field | Activity Tag | Data Source | Calculation |
-|-------------|--------------|-------------|-------------|
-| `error_name` | `error.type` | Exception type | `exception.GetType().Name` |
-| `stack_trace` | _(from exception)_ | Exception message | Truncated to 200 chars (message only, no actual stack trace for privacy) |
-
-**Important**: The `stack_trace` field is used for the truncated error message per the current proto schema. Actual stack traces are not sent for privacy/security reasons.
-
-**Implementation**:
-
-```csharp
-// In error handling code
-private void RecordError(Activity? activity, Exception exception)
-{
-    if (activity == null) return;
-
-    activity.SetTag("error.type", exception.GetType().Name);
-    activity.SetStatus(ActivityStatusCode.Error, TruncateMessage(exception.Message, 200));
-}
-
-private static string TruncateMessage(string message, int maxLength)
-{
-    if (string.IsNullOrEmpty(message)) return string.Empty;
-    return message.Length <= maxLength ? message : message.Substring(0, maxLength);
-}
-
-// In MetricsAggregator
-private DriverErrorInfo CreateErrorInfo(Exception exception)
-{
-    return new DriverErrorInfo
-    {
-        ErrorName = exception.GetType().Name,
-        StackTrace = TruncateMessage(exception.Message, 200)
-    };
-}
-```
-
----
-
-#### 4.4.10 Complete Activity Tag Reference
-
-**Connection-Level Tags** (set during `OpenAsync`):
-
-| Tag Name | Type | Required | Description |
-|----------|------|----------|-------------|
-| `session.id` | string | Yes | Thrift session handle |
-| `auth.type` | string | Yes | Authentication type |
-| `driver.version` | string | Yes | Driver version |
-| `driver.name` | string | Yes | "Databricks ADBC Driver" |
-| `runtime.name` | string | Yes | .NET runtime name |
-| `runtime.version` | string | Yes | .NET version |
-| `runtime.vendor` | string | No | "Microsoft" |
-| `os.name` | string | Yes | OS description |
-| `os.version` | string | Yes | OS version |
-| `os.arch` | string | Yes | Process architecture |
-| `client.app_name` | string | No | Client application name |
-| `locale.name` | string | No | Current culture name |
-| `char_set_encoding` | string | No | Character encoding |
-| `process.name` | string | No | Process name |
-| `connection.http_path` | string | Yes | HTTP path |
-| `connection.host` | string | Yes | Host URL |
-| `connection.port` | string | Yes | Port number |
-| `connection.mode` | string | Yes | "thrift" or "sea" |
-| `connection.auth_mech` | string | Yes | Auth mechanism |
-| `connection.auth_flow` | string | No | OAuth flow type |
-| `connection.batch_size` | long | No | Batch size |
-| `connection.poll_interval_ms` | long | No | Poll interval |
-| `connection.use_proxy` | bool | No | Proxy enabled |
-| `feature.arrow` | bool | Yes | Arrow support |
-| `feature.direct_results` | bool | Yes | Direct results enabled |
-| `feature.cloudfetch` | bool | Yes | CloudFetch enabled |
-| `feature.lz4` | bool | Yes | LZ4 decompression enabled |
-
-**Statement-Level Tags** (set during `ExecuteQuery/Update`):
-
-| Tag Name | Type | Required | Description |
-|----------|------|----------|-------------|
-| `statement.id` | string | Yes | Statement/operation handle |
-| `session.id` | string | Yes | Connection session ID |
-| `statement.type` | string | Yes | query/update/metadata/sql |
-| `operation.type` | string | No | Operation type enum value |
-| `operation.is_internal` | bool | No | Internal metadata call |
-| `result.format` | string | Yes | cloudfetch/inline_arrow/inline_json |
-| `result.compression_enabled` | bool | Yes | LZ4 compression used |
-| `result.ready_latency_ms` | long | No | Time to first row |
-| `result.consumption_latency_ms` | long | No | Time to consume all rows |
-| `poll.count` | int | No | Number of status polls |
-| `poll.latency_ms` | long | No | Total poll latency |
-| `retry.count` | int | No | Number of retries |
-| `error.type` | string | On error | Exception type name |
-
-**Activity Events**:
-
-| Event Name | Tags | Description |
-|------------|------|-------------|
-| `cloudfetch.download_summary` | `total_files`, `successful_downloads`, `failed_downloads`, `total_bytes`, `total_time_ms`, `initial_chunk_latency_ms`, `slowest_chunk_latency_ms` | Emitted when CloudFetch download completes |
-
----
-
-#### 4.4.11 MetricsAggregator Complete Implementation
-
-```csharp
-private OssSqlDriverTelemetryLog CreateTelemetryEvent(StatementTelemetryContext context)
-{
-    var telemetryLog = new OssSqlDriverTelemetryLog
-    {
-        SessionId = context.SessionId ?? string.Empty,
-        SqlStatementId = context.StatementId,
-        AuthType = context.AuthType ?? string.Empty,
-        OperationLatencyMs = context.TotalLatencyMs,
-
-        // System configuration (populated from connection activity)
-        SystemConfiguration = context.SystemConfiguration,
-
-        // Connection parameters (populated from connection activity)
-        DriverConnectionParams = context.ConnectionParameters,
-
-        // SQL operation details
-        SqlOperation = new SqlExecutionEvent
-        {
-            StatementType = context.StatementType ?? StatementType.StatementTypeUnspecified,
-            IsCompressed = context.CompressionEnabled ?? false,
-            ExecutionResult = ParseExecutionResult(context.ResultFormat),
-            RetryCount = context.RetryCount ?? 0,
-            ChunkDetails = new ChunkDetails
-            {
-                TotalChunksPresent = context.TotalChunksPresent ?? 0,
-                TotalChunksIterated = context.TotalChunksIterated ?? 0,
-                SumChunksDownloadTimeMillis = context.SumChunksDownloadTimeMs ?? 0,
-                InitialChunkLatencyMillis = context.InitialChunkLatencyMs ?? 0,
-                SlowestChunkLatencyMillis = context.SlowestChunkLatencyMs ?? 0
-            },
-            ResultLatency = new ResultLatency
-            {
-                ResultSetReadyLatencyMillis = context.ResultReadyLatencyMs ?? 0,
-                ResultSetConsumptionLatencyMillis = context.ResultConsumptionLatencyMs ?? 0
-            },
-            OperationDetail = new OperationDetail
-            {
-                NOperationStatusCalls = context.PollCount ?? 0,
-                OperationStatusLatencyMillis = context.PollLatencyMs ?? 0,
-                OperationType = context.OperationType ?? OperationType.OperationTypeUnspecified,
-                IsInternalCall = context.IsInternalCall ?? false
-            }
-        }
-    };
-
-    // Add error info if present
-    if (context.HasError)
-    {
-        telemetryLog.ErrorInfo = new DriverErrorInfo
-        {
-            ErrorName = context.ErrorName ?? string.Empty,
-            StackTrace = TruncateMessage(context.ErrorMessage, 200)
-        };
-    }
-
-    return telemetryLog;
-}
-
-private static ExecutionResultFormat ParseExecutionResult(string? format)
-{
-    return format?.ToLowerInvariant() switch
-    {
-        "cloudfetch" or "external_links" => ExecutionResultFormat.ExecutionResultExternalLinks,
-        "arrow" or "inline_arrow" => ExecutionResultFormat.ExecutionResultInlineArrow,
-        "json" or "inline_json" => ExecutionResultFormat.ExecutionResultInlineJson,
-        "columnar" or "columnar_inline" => ExecutionResultFormat.ExecutionResultColumnarInline,
-        _ => ExecutionResultFormat.ExecutionResultFormatUnspecified
-    };
-}
-```
-
----
-
-#### 4.4.12 StatementTelemetryContext Data Model
-
-The `StatementTelemetryContext` holds all aggregated metrics for a statement:
-
-```csharp
-internal sealed class StatementTelemetryContext
-{
-    // Identifiers
-    public string StatementId { get; set; } = string.Empty;
-    public string? SessionId { get; set; }
-    public string? AuthType { get; set; }
-
-    // System configuration (populated once per connection)
-    public DriverSystemConfiguration? SystemConfiguration { get; set; }
-    public DriverConnectionParameters? ConnectionParameters { get; set; }
-
-    // Statement execution
-    public StatementType? StatementType { get; set; }
-    public OperationType? OperationType { get; set; }
-    public bool? IsInternalCall { get; set; }
-    public string? ResultFormat { get; set; }
-    public bool? CompressionEnabled { get; set; }
-    public long TotalLatencyMs { get; set; }
-    public int? RetryCount { get; set; }
-
-    // Result latency
-    public long? ResultReadyLatencyMs { get; set; }
-    public long? ResultConsumptionLatencyMs { get; set; }
-
-    // Chunk details (CloudFetch)
-    public int? TotalChunksPresent { get; set; }
-    public int? TotalChunksIterated { get; set; }
-    public long? SumChunksDownloadTimeMs { get; set; }
-    public long? InitialChunkLatencyMs { get; set; }
-    public long? SlowestChunkLatencyMs { get; set; }
-
-    // Polling metrics
-    public int? PollCount { get; set; }
-    public long? PollLatencyMs { get; set; }
-
-    // Error info
-    public bool HasError { get; set; }
-    public string? ErrorName { get; set; }
-    public string? ErrorMessage { get; set; }
-}
-```
-
----
-
-#### 4.4.13 Summary: Proto Field Coverage
-
-| Proto Message | Field Count | Implemented | Notes |
-|---------------|-------------|-------------|-------|
-| `OssSqlDriverTelemetryLog` | 9 | 9 (100%) | All root fields covered |
-| `DriverSystemConfiguration` | 12 | 12 (100%) | All system info fields |
-| `DriverConnectionParameters` | 47 | 15 (32%) | Key fields only; others default |
-| `SqlExecutionEvent` | 9 | 9 (100%) | All execution fields |
-| `ChunkDetails` | 5 | 5 (100%) | All CloudFetch metrics |
-| `ResultLatency` | 2 | 2 (100%) | Both latency fields |
-| `OperationDetail` | 4 | 4 (100%) | All operation fields |
-| `DriverErrorInfo` | 2 | 2 (100%) | Error name and message |
-
-**Note**: `DriverConnectionParameters` has 47 fields but many are JDBC-specific or not applicable to the ADBC driver. Only relevant fields are populated; others remain at default values.
-
----
-
-#### 4.4.14 Future Tag Extensions (Deprecated - Replaced by Sections Above)
-
-This section was replaced by the comprehensive field mappings above. All proto fields are now documented with their corresponding Activity tags and data sources.
-
-**Fields Not Currently Mapped** (intentionally omitted):
-- `VolumeOperationEvent`: UC Volume operations not yet supported in ADBC driver
-- `DriverConnectionParameters` fields specific to JDBC (e.g., `google_service_account`, `jwt_key_file`, etc.)
-- `SqlExecutionEvent.java_uses_patched_arrow`: Java-specific, not applicable to C#
-
----
-
-This concludes Section 4.4. The comprehensive proto field population guide now covers:
-1. All root-level fields
-2. Complete `DriverSystemConfiguration` mapping
-3. Key `DriverConnectionParameters` fields
-4. Complete `SqlExecutionEvent` and nested message mappings
-5. Activity tag reference table
-6. Implementation code examples
+**Remove**:
+- `TelemetryTag.cs` — attribute and `TagExportScope` enum
+- `TelemetryTagRegistry.cs` — tag filtering registry
+- `[TelemetryTag(...)]` attributes on all constants
+- `GetDatabricksExportTags()` methods
+
+These Activity tag constants continue to serve OpenTelemetry distributed tracing (APM tools, Jaeger, etc.) but are **not used for telemetry data collection** in V3.
 
 ---
 
@@ -3405,9 +1713,9 @@ This concludes Section 4.4. The comprehensive proto field population guide now c
 
 ```mermaid
 flowchart TD
-    A[Activity Stopped] --> B[ActivityListener]
-    B --> C[MetricsAggregator]
-    C -->|Buffer & Aggregate| D{Flush Trigger?}
+    A[Statement Complete] --> B[BuildTelemetryLog]
+    B --> C[Enqueue to TelemetryClient]
+    C -->|Buffer| D{Flush Trigger?}
 
     D -->|Batch Size| E[Create TelemetryMetric]
     D -->|Time Interval| E
@@ -3474,6 +1782,37 @@ Same as original design:
 - **Flush interval**: Default 5 seconds
 - **Force flush**: On connection close
 
+### 5.4 JSON Serialization: snake_case Field Names
+
+**Requirement**: Proto fields must be serialized using **snake_case** names in JSON, matching the JDBC driver.
+
+The JDBC driver uses Jackson with explicit `@JsonProperty("session_id")` annotations — all JSON field names match the proto field names exactly (snake_case):
+
+```json
+{
+  "session_id": "abc123",
+  "sql_statement_id": "def456",
+  "system_configuration": { "driver_version": "1.0.0", "runtime_name": ".NET 8.0" },
+  "driver_connection_params": { "http_path": "/sql/1.0/warehouses/xyz", "host_info": { "host_url": "https://..." } },
+  "auth_type": "pat",
+  "sql_operation": { "statement_type": "STATEMENT_QUERY", "execution_result": "EXECUTION_RESULT_EXTERNAL_LINKS" },
+  "operation_latency_ms": 254
+}
+```
+
+The C# driver must match this format. `Google.Protobuf.JsonFormatter.Default` produces **camelCase** (`sessionId`) by default, which is incorrect. Use `WithPreserveProtoFieldNames(true)` to produce snake_case:
+
+```csharp
+// Correct: snake_case matching JDBC
+private static readonly JsonFormatter s_snakeCaseFormatter =
+    new JsonFormatter(JsonFormatter.Settings.Default.WithPreserveProtoFieldNames(true));
+
+var json = s_snakeCaseFormatter.Format(proto);
+// Output: { "session_id": "...", "sql_statement_id": "...", ... }
+```
+
+> **Note**: The outer `TelemetryFrontendLog` wrapper (non-proto, serialized via `System.Text.Json`) uses camelCase (`workspaceId`, `frontendLogEventId`) which is correct — only the inner proto `OssSqlDriverTelemetryLog` must use snake_case to match the proto schema and JDBC.
+
 ---
 
 ## 6. Configuration
@@ -3517,12 +1856,9 @@ public sealed class TelemetryConfiguration
 // In DatabricksConnection.OpenAsync()
 if (_telemetryConfig.Enabled && serverFeatureFlag.Enabled)
 {
-    _activityListener = new DatabricksActivityListener(
-        connection: this,
-        exporter: new DatabricksTelemetryExporter(_httpClient, this, _telemetryConfig),
-        config: _telemetryConfig);
-
-    _activityListener.Start();
+    _telemetryClient = TelemetryClientManager.GetInstance()
+        .GetOrCreateClient(_host, () => CreateTelemetryExporter(), _telemetryConfig);
+    _telemetrySessionContext = BuildTelemetrySessionContext();
 }
 ```
 
@@ -3534,7 +1870,7 @@ flowchart TD
     B -->|No| C[Telemetry Disabled]
     B -->|Yes| D{Server Feature Flag?}
     D -->|No| C
-    D -->|Yes| E[Start ActivityListener]
+    D -->|Yes| E[Initialize TelemetryClient]
     E --> F[Collect & Export Metrics]
 ```
 
@@ -3562,51 +1898,7 @@ flowchart TD
 - ✅ Feature flags (boolean settings)
 - ✅ Statement IDs (UUIDs)
 
-### 7.2 Activity Tag Filtering
-
-The listener filters tags using the centralized tag definition system:
-
-```csharp
-private TelemetryMetric ProcessActivity(Activity activity)
-{
-    var eventType = DetermineEventType(activity);
-    var metric = new TelemetryMetric { EventType = eventType };
-
-    foreach (var tag in activity.Tags)
-    {
-        // Use tag registry to determine if tag should be exported
-        if (TelemetryTagRegistry.ShouldExportToDatabricks(eventType, tag.Key))
-        {
-            // Export this tag
-            SetMetricProperty(metric, tag.Key, tag.Value);
-        }
-        // Tags not in registry are silently dropped for Databricks export
-        // But may still be exported to local diagnostics if marked ExportLocal
-    }
-
-    return metric;
-}
-```
-
-**Tag Export Examples:**
-
-| Tag Name | ExportLocal | ExportDatabricks | Reason |
-|----------|-------------|------------------|--------|
-| `statement.id` | ✅ | ✅ | Safe UUID, needed for correlation |
-| `result.format` | ✅ | ✅ | Safe enum value |
-| `result.chunk_count` | ✅ | ✅ | Numeric metric |
-| `driver.version` | ✅ | ✅ | Safe version string |
-| `server.address` | ✅ | ❌ | May contain PII (workspace host) |
-| `db.statement` | ✅ | ❌ | SQL query text (sensitive) |
-| `user.name` | ❌ | ❌ | Personal information |
-
-This approach ensures:
-- **Compile-time safety**: Tag names are constants
-- **Explicit control**: Each tag's export scope is clearly defined
-- **Easy auditing**: Single file to review for compliance
-- **Future-proof**: New tags must be added to definitions (prevents accidental leaks)
-
-### 7.3 Compliance
+### 7.2 Compliance
 
 Same as original design:
 - **GDPR**: No personal data
@@ -3636,17 +1928,15 @@ Same as original design:
 
 ```mermaid
 graph TD
-    A[Driver Operation] --> B[Activity Created]
-    B --> C[ActivityListener Callback]
-    C -->|Try-Catch TRACE| D[MetricsAggregator]
-    D -->|Try-Catch TRACE| E[TelemetryClient]
+    A[Driver Operation] --> B[StatementTelemetryContext]
+    B --> C[BuildTelemetryLog]
+    C -->|Try-Catch TRACE| E[TelemetryClient]
     E --> F[Circuit Breaker]
     F -->|Sees Exception| G{Track Failure}
     G -->|After Tracking| H[Exporter]
     H -->|Try-Catch TRACE| I[HTTP Call]
 
     C -.->|Exception Swallowed| J[Log at TRACE]
-    D -.->|Exception Swallowed| J
     E -.->|Exception Swallowed| J
     F -.->|Circuit Opens| K[Log at DEBUG]
     H -.->|Exception Swallowed| J
@@ -3658,36 +1948,25 @@ graph TD
     style H fill:#ffccbc
 ```
 
-#### Activity Listener Error Handling
+#### Statement Telemetry Error Handling
+
+All telemetry operations are wrapped in try-catch at the statement level:
 
 ```csharp
-private void OnActivityStopped(Activity activity)
+// In DatabricksStatement base
+protected void EmitTelemetry()
 {
     try
     {
-        _aggregator.ProcessActivity(activity);
+        if (_telemetryContext == null) return;
+        var proto = _telemetryContext.BuildTelemetryLog();
+        var frontendLog = WrapInFrontendLog(proto);
+        _connection.TelemetrySessionContext?.TelemetryClient?.Enqueue(frontendLog);
     }
     catch (Exception ex)
     {
-        // Swallow ALL exceptions per requirement
-        // Use TRACE level to avoid customer anxiety
-        Debug.WriteLine($"[TRACE] Telemetry listener error: {ex.Message}");
-    }
-}
-```
-
-#### MetricsAggregator Error Handling
-
-```csharp
-public void ProcessActivity(Activity activity)
-{
-    try
-    {
-        // Extract metrics, buffer, flush if needed
-    }
-    catch (Exception ex)
-    {
-        Debug.WriteLine($"[TRACE] Telemetry aggregator error: {ex.Message}");
+        // Swallow ALL exceptions — never impact driver operation
+        Debug.WriteLine($"[TRACE] Telemetry emit error: {ex.Message}");
     }
 }
 ```
@@ -3779,7 +2058,7 @@ internal static class ExceptionClassifier
 }
 ```
 
-#### Exception Buffering in MetricsAggregator
+#### Exception Buffering in Statement
 
 ```csharp
 public void RecordException(string statementId, Exception ex)
@@ -3835,13 +2114,12 @@ string statementId = GetStatementId();
 try
 {
     var result = await ExecuteStatementAsync(statementId);
-    _aggregator.CompleteStatement(statementId, failed: false);
+    EmitTelemetry();  // Emit on success
 }
 catch (Exception ex)
 {
-    // Record exception (classified as terminal or retryable)
-    _aggregator.RecordException(statementId, ex);
-    _aggregator.CompleteStatement(statementId, failed: true);
+    RecordError(ex);
+    EmitTelemetry();  // Emit on error
     throw; // Re-throw for application handling
 }
 ```
@@ -3864,88 +2142,110 @@ catch (Exception ex)
 
 ## 9. Graceful Shutdown
 
-**Requirement**: Every telemetry client and HTTP client must be closed gracefully. Maintain reference counting properly to determine when to close shared resources.
+**Requirement**: All pending telemetry logs must be sent to Databricks **before** the connection dispose completes. The user must be able to trust that after `connection.Dispose()` returns, all telemetry has been delivered (or at least attempted).
 
-### 9.1 Shutdown Sequence
+### 9.1 Flush-Before-Close Guarantee
+
+The JDBC driver achieves this with a **synchronous blocking flush** on close:
+
+```java
+// JDBC TelemetryClient.close()
+collector.exportAllPendingTelemetryDetails();  // Export any pending statement telemetry
+flush(true).get();                             // Block until HTTP flush completes
+```
+
+The C# driver follows the same pattern. On connection dispose:
+
+1. **Emit any pending statement telemetry** that hasn't been emitted yet
+2. **Synchronously flush** the `TelemetryClient` queue — block until the HTTP POST completes (or fails/times out)
+3. **Release** the shared client (decrement ref count)
+
+This guarantees: after `connection.Dispose()` returns, all telemetry logs from that connection have been sent (or failed with timeout).
+
+### 9.2 Shutdown Sequence
 
 ```mermaid
 sequenceDiagram
     participant App as Application
     participant Conn as DatabricksConnection
-    participant Listener as ActivityListener
-    participant Manager as TelemetryClientManager
     participant Client as TelemetryClient (shared)
-    participant FFCache as FeatureFlagCache
+    participant Exporter as TelemetryExporter
+    participant Server as Databricks Service
+    participant Manager as TelemetryClientManager
 
-    App->>Conn: CloseAsync()
+    App->>Conn: Dispose()
 
-    Conn->>Listener: StopAsync()
-    Listener->>Listener: Flush pending metrics
-    Listener->>Listener: Dispose
+    rect rgb(255, 243, 224)
+        Note over Conn,Server: Flush-before-close guarantee
+        Conn->>Client: FlushAsync() — blocking wait
+        Client->>Exporter: ExportAsync(pendingBatch)
+        Exporter->>Server: POST /telemetry-ext
+        Server-->>Exporter: 200 OK
+        Exporter-->>Client: Success
+        Client-->>Conn: Flush complete
+    end
 
     Conn->>Manager: ReleaseClientAsync(host)
     Manager->>Manager: Decrement RefCount
 
     alt RefCount == 0 (Last Connection)
         Manager->>Client: CloseAsync()
-        Client->>Client: Flush pending events
-        Client->>Client: Shutdown executor
-        Client->>Client: Close HTTP client
+        Client->>Client: Final flush (if any remaining)
+        Client->>Client: Stop flush timer
     else RefCount > 0 (Other Connections Exist)
         Manager->>Manager: Keep client alive
     end
-
-    Conn->>FFCache: ReleaseContext(host)
-    FFCache->>FFCache: Decrement RefCount
-
-    alt RefCount == 0
-        FFCache->>FFCache: Remove context
-    else RefCount > 0
-        FFCache->>FFCache: Keep context
-    end
 ```
 
-### 9.2 Connection Close Implementation
+### 9.3 Connection Close Implementation
 
 ```csharp
-public sealed class DatabricksConnection : AdbcConnection
+// In DatabricksConnection.Dispose (pseudocode)
+private void DisposeTelemetry()
 {
-    private string? _host;
-    private DatabricksActivityListener? _activityListener;
-
-    protected override async ValueTask DisposeAsyncCore()
+    try
     {
-        if (_host == null) return;
+        // Step 1: Synchronous flush — BLOCKS until HTTP completes or times out
+        // This is the flush-before-close guarantee
+        _telemetryClient?.FlushAsync()
+            .ConfigureAwait(false).GetAwaiter().GetResult();
 
-        try
-        {
-            // Step 1: Stop activity listener and flush pending metrics
-            if (_activityListener != null)
-            {
-                await _activityListener.StopAsync();
-                _activityListener.Dispose();
-                _activityListener = null;
-            }
-
-            // Step 2: Release telemetry client (decrements ref count, closes if last)
-            await TelemetryClientManager.GetInstance().ReleaseClientAsync(_host);
-
-            // Step 3: Release feature flag context (decrements ref count)
-            FeatureFlagCache.GetInstance().ReleaseContext(_host);
-        }
-        catch (Exception ex)
-        {
-            // Swallow all exceptions per requirement
-            Debug.WriteLine($"[TRACE] Error during telemetry cleanup: {ex.Message}");
-        }
-
-        // Continue with normal connection cleanup
-        await base.DisposeAsyncCore();
+        // Step 2: Release shared client (decrements ref count, closes if last)
+        TelemetryClientManager.GetInstance()
+            .ReleaseClientAsync(_host)
+            .ConfigureAwait(false).GetAwaiter().GetResult();
+    }
+    catch (Exception ex)
+    {
+        // Swallow all exceptions — never fail the connection close
+        Debug.WriteLine($"[TRACE] Error during telemetry cleanup: {ex.Message}");
     }
 }
 ```
 
-### 9.3 TelemetryClient Close Implementation
+**Why synchronous blocking?** The base class hierarchy uses `IDisposable` (not `IAsyncDisposable`), so `Dispose()` is synchronous. We use `.GetAwaiter().GetResult()` to block until the flush HTTP call completes. This matches JDBC's `flush(true).get()` pattern.
+
+### 9.4 Timeout Protection
+
+The flush must not block indefinitely. Add a timeout to prevent hanging on connection close:
+
+```csharp
+// Flush with timeout — don't block forever
+var flushTask = _telemetryClient.FlushAsync();
+if (!flushTask.Wait(TimeSpan.FromSeconds(5)))
+{
+    Debug.WriteLine("[TRACE] Telemetry flush timed out after 5s, proceeding with close");
+}
+```
+
+| Scenario | Behavior |
+|----------|----------|
+| Flush succeeds quickly | Dispose returns after HTTP 200 |
+| Flush takes > 5 seconds | Dispose returns after timeout, logs are best-effort |
+| Network failure | CircuitBreaker handles it, flush returns with failure, Dispose continues |
+| TelemetryClient already closed | No-op, Dispose continues |
+
+### 9.5 TelemetryClient Close Implementation
 
 ```csharp
 public sealed class TelemetryClient : ITelemetryClient
@@ -3980,7 +2280,7 @@ public sealed class TelemetryClient : ITelemetryClient
 }
 ```
 
-### 9.4 Reference Counting Example
+### 9.6 Reference Counting Example
 
 **TelemetryClientHolder with Reference Counting**:
 
@@ -4009,7 +2309,7 @@ await TelemetryClientManager.GetInstance().ReleaseClientAsync("host1");
 
 **Same logic applies to FeatureFlagCache**.
 
-### 9.5 Shutdown Contracts
+### 9.7 Shutdown Contracts
 
 **TelemetryClientManager**:
 - `GetOrCreateClient()`: Atomically increments ref count
@@ -4033,942 +2333,258 @@ await TelemetryClientManager.GetInstance().ReleaseClientAsync("host1");
 
 ## 10. Testing Strategy
 
-### 10.1 Unit Tests
+### 10.1 Proto Field Coverage Tests
 
-**DatabricksActivityListener Tests**:
-- `Listener_FiltersCorrectActivitySource`
-- `Listener_ExtractsTagsFromActivity`
-- `Listener_HandlesActivityWithoutTags`
-- `Listener_DoesNotThrowOnError`
-- `Listener_RespectsFeatureFlag`
+Every field in the `OssSqlDriverTelemetryLog` proto must be populated and verified. The table below maps each proto field to the expected source and validation:
 
-**MetricsAggregator Tests**:
-- `Aggregator_CombinesActivitiesByStatementId`
-- `Aggregator_EmitsOnStatementComplete`
-- `Aggregator_HandlesConnectionActivity`
-- `Aggregator_FlushesOnBatchSize`
-- `Aggregator_FlushesOnTimeInterval`
+#### OssSqlDriverTelemetryLog (top-level)
 
-**TelemetryExporter Tests**:
-- Same as original design (endpoints, retry, circuit breaker)
+| Proto Field | Type | Expected Source | Validation |
+|-------------|------|----------------|------------|
+| `session_id` | string | `SessionHandle.SessionId` (GUID hex) | Non-empty, 32-char hex |
+| `sql_statement_id` | string | `OperationHandle.OperationId` (GUID hex) | Non-empty, 32-char hex |
+| `system_configuration` | message | Connection properties + runtime info | All sub-fields populated (see below) |
+| `driver_connection_params` | message | Connection properties | `http_path`, `host_info`, `mode` populated (see below) |
+| `auth_type` | string | Inferred from token/OAuth config | One of: `"pat"`, `"oauth"`, `"basic"` — never `"unknown"` |
+| `sql_operation` | message | Statement execution data | Present with `statement_type` + `execution_result` (see below) |
+| `error_info` | message | Exception (if error occurred) | Present only on error, with `error_name` |
+| `operation_latency_ms` | int64 | `ExecuteQueryAsyncInternal` duration | > 0 for any real query |
 
-**New Component Tests** (per-host management):
-- `FeatureFlagCache_CachesPerHost`
-- `FeatureFlagCache_ExpiresAfter15Minutes`
-- `FeatureFlagCache_RefCountingWorks`
-- `TelemetryClientManager_OneClientPerHost`
-- `TelemetryClientManager_RefCountingWorks`
-- `TelemetryClientManager_ClosesOnLastRelease`
-- `CircuitBreaker_OpensAfterFailures`
-- `CircuitBreaker_ClosesAfterSuccesses`
-- `CircuitBreaker_PerHostIsolation`
-- `ExceptionClassifier_IdentifiesTerminal`
-- `ExceptionClassifier_IdentifiesRetryable`
-- `MetricsAggregator_BuffersRetryableExceptions`
-- `MetricsAggregator_FlushesTerminalImmediately`
+#### DriverSystemConfiguration
 
-### 10.2 Integration Tests
+| Proto Field | Expected Value | Validation |
+|-------------|---------------|------------|
+| `driver_version` | Assembly `ProductVersion` | Non-empty, contains version number |
+| `driver_name` | `"Apache Arrow ADBC Databricks Driver"` | Exact match |
+| `runtime_name` | e.g. `".NET 8.0.23"` | Non-empty |
+| `runtime_version` | e.g. `"8.0.23"` | Non-empty |
+| `runtime_vendor` | `"Microsoft"` | Non-empty |
+| `os_name` | e.g. `"Ubuntu 20.04.6 LTS"` | Non-empty |
+| `os_version` | e.g. `"5.4.0.1154"` | Non-empty |
+| `os_arch` | e.g. `"X64"` or `"Arm64"` | Non-empty |
+| `client_app_name` | Entry assembly name or `"unknown"` | Non-empty |
+| `locale_name` | e.g. `"en-US"` | Non-empty |
+| `char_set_encoding` | `"utf-8"` | Exact match |
+| `process_name` | e.g. `"dotnet"` | Non-empty |
 
-**End-to-End with Activity**:
-- `ActivityBased_ConnectionOpen_ExportedSuccessfully`
-- `ActivityBased_StatementWithChunks_AggregatedCorrectly`
-- `ActivityBased_ErrorActivity_CapturedInMetrics`
-- `ActivityBased_FeatureFlagDisabled_NoExport`
+#### DriverConnectionParameters
 
-**Compatibility Tests**:
-- `ActivityBased_CoexistsWithOpenTelemetry`
-- `ActivityBased_CorrelationIdPreserved`
-- `ActivityBased_ParentChildSpansWork`
+| Proto Field | Expected Value | Validation |
+|-------------|---------------|------------|
+| `http_path` | e.g. `"/sql/1.0/warehouses/abc123"` | Non-empty, starts with `/` |
+| `mode` | `DRIVER_MODE_THRIFT` or `DRIVER_MODE_SEA` | Not `UNSPECIFIED` |
+| `host_info.host_url` | e.g. `"https://host.cloud.databricks.com:443"` | Non-empty, starts with `https://` |
+| `host_info.port` | Port number (may be 0 if embedded in URL) | — |
+| `auth_mech` | e.g. `DRIVER_AUTH_MECH_PAT` | Not `UNSPECIFIED` |
+| `auth_flow` | e.g. `DRIVER_AUTH_FLOW_TOKEN_PASSTHROUGH` | Not `UNSPECIFIED` |
+| `enable_arrow` | `true` | Boolean |
+| `enable_direct_results` | `true` (if enabled) | Boolean |
+| `rows_fetched_per_block` | e.g. `"2000000"` | Non-empty |
+| `socket_timeout` | e.g. `"900"` | Non-empty |
+| `async_poll_interval_millis` | e.g. `"100"` | Non-empty |
+| `check_certificate_revocation` | Boolean | — |
+| `string_column_length` | e.g. `255` | > 0 |
 
-**New Integration Tests** (production requirements):
-- `MultipleConnections_SameHost_SharesClient`
-- `FeatureFlagCache_SharedAcrossConnections`
-- `CircuitBreaker_StopsFlushingWhenOpen`
-- `GracefulShutdown_LastConnection_ClosesClient`
-- `TerminalException_FlushedImmediately`
-- `RetryableException_BufferedUntilComplete`
+#### SqlExecutionEvent
 
-### 10.3 Performance Tests
+| Proto Field | Expected Value | Validation |
+|-------------|---------------|------------|
+| `statement_type` | `STATEMENT_QUERY`, `STATEMENT_UPDATE`, `STATEMENT_METADATA` | Not `UNSPECIFIED` |
+| `is_compressed` | `true` if LZ4 enabled | Boolean |
+| `execution_result` | `EXECUTION_RESULT_INLINE_ARROW` or `EXECUTION_RESULT_EXTERNAL_LINKS` | Not `UNSPECIFIED` |
+| `retry_count` | Number of retries (0 if none) | >= 0 |
+| `chunk_details` | Present for CloudFetch results | See below |
+| `result_latency` | Present for completed queries | See below |
+| `operation_detail` | Present when polling occurred | See below |
 
-**Overhead Measurement**:
-- `ActivityListener_Overhead_LessThan1Percent`
-- `MetricExtraction_Completes_UnderOneMicrosecond`
+#### ChunkDetails (CloudFetch only)
 
-Compare:
-- Baseline: Activity with no listener
-- With listener but disabled: Should be ~0% overhead
-- With listener enabled: Should be < 1% overhead
+| Proto Field | Validation |
+|-------------|------------|
+| `initial_chunk_latency_millis` | > 0 |
+| `slowest_chunk_latency_millis` | >= `initial_chunk_latency_millis` |
+| `total_chunks_present` | > 0 |
+| `total_chunks_iterated` | > 0, <= `total_chunks_present` |
+| `sum_chunks_download_time_millis` | > 0 |
 
-### 10.4 Test Coverage Goals
+#### ResultLatency
 
-| Component | Unit Test Coverage | Integration Test Coverage |
-|-----------|-------------------|---------------------------|
-| DatabricksActivityListener | > 90% | > 80% |
-| MetricsAggregator | > 90% | > 80% |
-| TelemetryExporter | > 90% | > 80% |
-| Activity Tag Filtering | 100% | N/A |
-| FeatureFlagCache | > 90% | > 80% |
-| TelemetryClientManager | > 90% | > 80% |
-| CircuitBreaker | > 90% | > 80% |
-| ExceptionClassifier | 100% | N/A |
-| **Proto Field Population** | **100%** | **> 80%** |
+| Proto Field | Validation |
+|-------------|------------|
+| `result_set_ready_latency_millis` | > 0 (time from execute to first batch) |
+| `result_set_consumption_latency_millis` | >= 0 (time from first batch to all consumed) |
+
+#### OperationDetail
+
+| Proto Field | Validation |
+|-------------|------------|
+| `n_operation_status_calls` | > 0 (if polling occurred) |
+| `operation_status_latency_millis` | > 0 (if polling occurred) |
+| `operation_type` | e.g. `OPERATION_EXECUTE_STATEMENT` — not `UNSPECIFIED` |
+
+#### DriverErrorInfo (error path only)
+
+| Proto Field | Validation |
+|-------------|------------|
+| `error_name` | Non-empty, contains exception type name |
+| `stack_trace` | Non-empty, contains error message |
 
 ---
 
-### 10.5 Proto Field Population Tests
-
-This section covers comprehensive testing for all proto field mappings defined in Section 4.4.
-
-#### 10.5.1 Test Categories
-
-```mermaid
-flowchart TD
-    A[Proto Field Population Tests] --> B[Unit Tests]
-    A --> C[Integration Tests]
-    A --> D[Schema Validation Tests]
-
-    B --> B1[Tag to Proto Mapping]
-    B --> B2[Enum Conversion]
-    B --> B3[System Info Extraction]
-    B --> B4[Aggregation Logic]
-
-    C --> C1[End-to-End Flow]
-    C --> C2[Real Connection Tests]
-
-    D --> D1[Proto Schema Alignment]
-    D --> D2[JSON Serialization]
-    D --> D3[Binary Roundtrip]
-```
-
-#### 10.5.2 Unit Tests - DriverSystemConfiguration
-
-**File**: `test/Unit/Telemetry/ProtoPopulation/DriverSystemConfigurationTests.cs`
-
-```csharp
-public class DriverSystemConfigurationTests : IDisposable
-{
-    private readonly ActivitySource _activitySource;
-    private readonly MockTelemetryExporter _mockExporter;
-    private readonly MetricsAggregator _aggregator;
-
-    public DriverSystemConfigurationTests()
-    {
-        _activitySource = new ActivitySource("TestSource");
-        _mockExporter = new MockTelemetryExporter();
-        _aggregator = new MetricsAggregator(_mockExporter, new TelemetryConfiguration());
-
-        // Enable activity listening
-        ActivitySource.AddActivityListener(new ActivityListener
-        {
-            ShouldListenTo = _ => true,
-            Sample = (ref ActivityCreationOptions<ActivityContext> _) =>
-                ActivitySamplingResult.AllDataAndRecorded
-        });
-    }
-
-    [Fact]
-    public void DriverVersion_MapsToProto()
-    {
-        // Arrange
-        using var activity = _activitySource.StartActivity("Connection.Open");
-        activity?.SetTag("driver.version", "1.2.3");
-        activity?.SetTag("session.id", "test-session");
-        activity?.Stop();
-
-        // Act
-        _aggregator.ProcessActivity(activity!);
-        _aggregator.FlushAsync().Wait();
-
-        // Assert
-        var log = _mockExporter.ExportedLogs.First();
-        var proto = DeserializeProto(log);
-        Assert.Equal("1.2.3", proto.SystemConfiguration.DriverVersion);
-    }
-
-    [Fact]
-    public void RuntimeInfo_ExtractedFromFrameworkDescription()
-    {
-        // Arrange
-        using var activity = _activitySource.StartActivity("Connection.Open");
-        activity?.SetTag("runtime.name", ".NET");
-        activity?.SetTag("runtime.version", "8.0.0");
-        activity?.SetTag("runtime.vendor", "Microsoft");
-        activity?.SetTag("session.id", "test-session");
-        activity?.Stop();
-
-        // Act
-        _aggregator.ProcessActivity(activity!);
-        _aggregator.FlushAsync().Wait();
-
-        // Assert
-        var proto = DeserializeProto(_mockExporter.ExportedLogs.First());
-        Assert.Equal(".NET", proto.SystemConfiguration.RuntimeName);
-        Assert.Equal("8.0.0", proto.SystemConfiguration.RuntimeVersion);
-        Assert.Equal("Microsoft", proto.SystemConfiguration.RuntimeVendor);
-    }
-
-    [Theory]
-    [InlineData("Windows 10.0.19041", "10.0.19041.0", "X64")]
-    [InlineData("Linux 5.4.0-1054-azure", "5.4.0", "X64")]
-    [InlineData("Darwin 21.6.0", "21.6.0", "Arm64")]
-    public void OsInfo_MapsToProto(string osName, string osVersion, string osArch)
-    {
-        // Arrange
-        using var activity = _activitySource.StartActivity("Connection.Open");
-        activity?.SetTag("os.name", osName);
-        activity?.SetTag("os.version", osVersion);
-        activity?.SetTag("os.arch", osArch);
-        activity?.SetTag("session.id", "test-session");
-        activity?.Stop();
-
-        // Act
-        _aggregator.ProcessActivity(activity!);
-        _aggregator.FlushAsync().Wait();
-
-        // Assert
-        var proto = DeserializeProto(_mockExporter.ExportedLogs.First());
-        Assert.Equal(osName, proto.SystemConfiguration.OsName);
-        Assert.Equal(osVersion, proto.SystemConfiguration.OsVersion);
-        Assert.Equal(osArch, proto.SystemConfiguration.OsArch);
-    }
-
-    [Fact]
-    public void ClientInfo_MapsToProto()
-    {
-        // Arrange
-        using var activity = _activitySource.StartActivity("Connection.Open");
-        activity?.SetTag("client.app_name", "PowerBI");
-        activity?.SetTag("locale.name", "en-US");
-        activity?.SetTag("char_set_encoding", "utf-8");
-        activity?.SetTag("process.name", "PBIDesktop");
-        activity?.SetTag("session.id", "test-session");
-        activity?.Stop();
-
-        // Act
-        _aggregator.ProcessActivity(activity!);
-        _aggregator.FlushAsync().Wait();
-
-        // Assert
-        var proto = DeserializeProto(_mockExporter.ExportedLogs.First());
-        Assert.Equal("PowerBI", proto.SystemConfiguration.ClientAppName);
-        Assert.Equal("en-US", proto.SystemConfiguration.LocaleName);
-        Assert.Equal("utf-8", proto.SystemConfiguration.CharSetEncoding);
-        Assert.Equal("PBIDesktop", proto.SystemConfiguration.ProcessName);
-    }
-
-    [Fact]
-    public void MissingTags_DefaultToEmptyString()
-    {
-        // Arrange - activity with minimal tags
-        using var activity = _activitySource.StartActivity("Connection.Open");
-        activity?.SetTag("session.id", "test-session");
-        activity?.Stop();
-
-        // Act
-        _aggregator.ProcessActivity(activity!);
-        _aggregator.FlushAsync().Wait();
-
-        // Assert - proto fields should be empty, not null
-        var proto = DeserializeProto(_mockExporter.ExportedLogs.First());
-        Assert.Equal(string.Empty, proto.SystemConfiguration.RuntimeVersion);
-        Assert.Equal(string.Empty, proto.SystemConfiguration.OsName);
-    }
-
-    public void Dispose() => _activitySource.Dispose();
-}
-```
-
-#### 10.5.3 Unit Tests - DriverConnectionParameters
-
-**File**: `test/Unit/Telemetry/ProtoPopulation/DriverConnectionParametersTests.cs`
-
-```csharp
-public class DriverConnectionParametersTests : IDisposable
-{
-    // ... similar setup ...
-
-    [Theory]
-    [InlineData("thrift", DriverModeType.DriverModeThrift)]
-    [InlineData("sea", DriverModeType.DriverModeSea)]
-    [InlineData("unknown", DriverModeType.DriverModeTypeUnspecified)]
-    [InlineData(null, DriverModeType.DriverModeTypeUnspecified)]
-    public void DriverMode_MapsCorrectly(string? tagValue, DriverModeType expected)
-    {
-        // Arrange
-        using var activity = _activitySource.StartActivity("Connection.Open");
-        if (tagValue != null)
-            activity?.SetTag("connection.mode", tagValue);
-        activity?.SetTag("session.id", "test-session");
-        activity?.Stop();
-
-        // Act
-        _aggregator.ProcessActivity(activity!);
-        _aggregator.FlushAsync().Wait();
-
-        // Assert
-        var proto = DeserializeProto(_mockExporter.ExportedLogs.First());
-        Assert.Equal(expected, proto.DriverConnectionParams.Mode);
-    }
-
-    [Theory]
-    [InlineData("pat", DriverAuthMechType.DriverAuthMechPat)]
-    [InlineData("oauth", DriverAuthMechType.DriverAuthMechOauth)]
-    [InlineData("other", DriverAuthMechType.DriverAuthMechOther)]
-    public void AuthMech_MapsCorrectly(string tagValue, DriverAuthMechType expected)
-    {
-        // ... similar test ...
-    }
-
-    [Theory]
-    [InlineData("token_passthrough", DriverAuthFlowType.DriverAuthFlowTokenPassthrough)]
-    [InlineData("client_credentials", DriverAuthFlowType.DriverAuthFlowClientCredentials)]
-    [InlineData("browser", DriverAuthFlowType.DriverAuthFlowBrowserBasedAuthentication)]
-    public void AuthFlow_MapsCorrectly(string tagValue, DriverAuthFlowType expected)
-    {
-        // ... similar test ...
-    }
-
-    [Fact]
-    public void FeatureFlags_MapToBooleans()
-    {
-        // Arrange
-        using var activity = _activitySource.StartActivity("Connection.Open");
-        activity?.SetTag("feature.arrow", true);
-        activity?.SetTag("feature.direct_results", true);
-        activity?.SetTag("connection.use_proxy", false);
-        activity?.SetTag("session.id", "test-session");
-        activity?.Stop();
-
-        // Act
-        _aggregator.ProcessActivity(activity!);
-        _aggregator.FlushAsync().Wait();
-
-        // Assert
-        var proto = DeserializeProto(_mockExporter.ExportedLogs.First());
-        Assert.True(proto.DriverConnectionParams.EnableArrow);
-        Assert.True(proto.DriverConnectionParams.EnableDirectResults);
-        Assert.False(proto.DriverConnectionParams.UseProxy);
-    }
-
-    [Fact]
-    public void NumericParameters_MapCorrectly()
-    {
-        // Arrange
-        using var activity = _activitySource.StartActivity("Connection.Open");
-        activity?.SetTag("connection.batch_size", 2000000L);
-        activity?.SetTag("connection.poll_interval_ms", 100L);
-        activity?.SetTag("session.id", "test-session");
-        activity?.Stop();
-
-        // Act
-        _aggregator.ProcessActivity(activity!);
-        _aggregator.FlushAsync().Wait();
-
-        // Assert
-        var proto = DeserializeProto(_mockExporter.ExportedLogs.First());
-        Assert.Equal(2000000, proto.DriverConnectionParams.RowsFetchedPerBlock);
-        Assert.Equal(100, proto.DriverConnectionParams.AsyncPollIntervalMillis);
-    }
-}
-```
-
-#### 10.5.4 Unit Tests - SqlExecutionEvent & Nested Messages
-
-**File**: `test/Unit/Telemetry/ProtoPopulation/SqlExecutionEventTests.cs`
-
-```csharp
-public class SqlExecutionEventTests : IDisposable
-{
-    // ... setup ...
-
-    [Theory]
-    [InlineData("cloudfetch", ExecutionResultFormat.ExecutionResultExternalLinks)]
-    [InlineData("external_links", ExecutionResultFormat.ExecutionResultExternalLinks)]
-    [InlineData("arrow", ExecutionResultFormat.ExecutionResultInlineArrow)]
-    [InlineData("inline_arrow", ExecutionResultFormat.ExecutionResultInlineArrow)]
-    [InlineData("json", ExecutionResultFormat.ExecutionResultInlineJson)]
-    [InlineData("columnar", ExecutionResultFormat.ExecutionResultColumnarInline)]
-    public void ExecutionResultFormat_MapsCorrectly(string tagValue, ExecutionResultFormat expected)
-    {
-        // Arrange
-        var statementId = Guid.NewGuid().ToString("N");
-        using var activity = _activitySource.StartActivity("Statement.Execute");
-        activity?.SetTag("statement.id", statementId);
-        activity?.SetTag("session.id", "test-session");
-        activity?.SetTag("result.format", tagValue);
-        activity?.Stop();
-
-        // Act
-        _aggregator.ProcessActivity(activity!);
-        _aggregator.CompleteStatement(statementId);
-        _aggregator.FlushAsync().Wait();
-
-        // Assert
-        var proto = DeserializeProto(_mockExporter.ExportedLogs.First());
-        Assert.Equal(expected, proto.SqlOperation.ExecutionResult);
-    }
-
-    [Theory]
-    [InlineData("query", StatementType.StatementQuery)]
-    [InlineData("update", StatementType.StatementUpdate)]
-    [InlineData("metadata", StatementType.StatementMetadata)]
-    [InlineData("sql", StatementType.StatementSql)]
-    public void StatementType_MapsCorrectly(string tagValue, StatementType expected)
-    {
-        // ... similar test ...
-    }
-
-    [Fact]
-    public void ChunkDetails_AggregatedFromCloudFetchEvent()
-    {
-        // Arrange
-        var statementId = Guid.NewGuid().ToString("N");
-        using var activity = _activitySource.StartActivity("Statement.Execute");
-        activity?.SetTag("statement.id", statementId);
-        activity?.SetTag("session.id", "test-session");
-
-        // Add CloudFetch summary event
-        activity?.AddEvent(new ActivityEvent("cloudfetch.download_summary",
-            tags: new ActivityTagsCollection
-            {
-                { "total_files", 10 },
-                { "successful_downloads", 8 },
-                { "total_time_ms", 5000L },
-                { "initial_chunk_latency_ms", 100L },
-                { "slowest_chunk_latency_ms", 800L }
-            }));
-
-        activity?.Stop();
-
-        // Act
-        _aggregator.ProcessActivity(activity!);
-        _aggregator.CompleteStatement(statementId);
-        _aggregator.FlushAsync().Wait();
-
-        // Assert
-        var proto = DeserializeProto(_mockExporter.ExportedLogs.First());
-        Assert.Equal(10, proto.SqlOperation.ChunkDetails.TotalChunksPresent);
-        Assert.Equal(8, proto.SqlOperation.ChunkDetails.TotalChunksIterated);
-        Assert.Equal(5000, proto.SqlOperation.ChunkDetails.SumChunksDownloadTimeMillis);
-        Assert.Equal(100, proto.SqlOperation.ChunkDetails.InitialChunkLatencyMillis);
-        Assert.Equal(800, proto.SqlOperation.ChunkDetails.SlowestChunkLatencyMillis);
-    }
-
-    [Fact]
-    public void InitialChunkLatency_OnlySetOnce()
-    {
-        // Arrange - simulate multiple chunk downloads
-        var statementId = Guid.NewGuid().ToString("N");
-
-        // First activity with initial latency
-        using var activity1 = _activitySource.StartActivity("CloudFetch.Download");
-        activity1?.SetTag("statement.id", statementId);
-        activity1?.SetTag("chunk.initial_latency_ms", 100L);
-        activity1?.Stop();
-        _aggregator.ProcessActivity(activity1!);
-
-        // Second activity with different latency (should NOT override initial)
-        using var activity2 = _activitySource.StartActivity("CloudFetch.Download");
-        activity2?.SetTag("statement.id", statementId);
-        activity2?.SetTag("chunk.initial_latency_ms", 50L);
-        activity2?.Stop();
-        _aggregator.ProcessActivity(activity2!);
-
-        // Act
-        _aggregator.CompleteStatement(statementId);
-        _aggregator.FlushAsync().Wait();
-
-        // Assert - initial should be 100, not 50
-        var proto = DeserializeProto(_mockExporter.ExportedLogs.First());
-        Assert.Equal(100, proto.SqlOperation.ChunkDetails.InitialChunkLatencyMillis);
-    }
-
-    [Fact]
-    public void SlowestChunkLatency_TracksMaximum()
-    {
-        // Arrange - simulate multiple downloads with varying latencies
-        var statementId = Guid.NewGuid().ToString("N");
-        var latencies = new[] { 100L, 500L, 200L, 800L, 300L };
-
-        foreach (var latency in latencies)
-        {
-            using var activity = _activitySource.StartActivity("CloudFetch.Download");
-            activity?.SetTag("statement.id", statementId);
-            activity?.SetTag("chunk.slowest_latency_ms", latency);
-            activity?.Stop();
-            _aggregator.ProcessActivity(activity!);
-        }
-
-        // Act
-        _aggregator.CompleteStatement(statementId);
-        _aggregator.FlushAsync().Wait();
-
-        // Assert - should be max (800)
-        var proto = DeserializeProto(_mockExporter.ExportedLogs.First());
-        Assert.Equal(800, proto.SqlOperation.ChunkDetails.SlowestChunkLatencyMillis);
-    }
-
-    [Fact]
-    public void ResultLatency_MapsCorrectly()
-    {
-        // Arrange
-        var statementId = Guid.NewGuid().ToString("N");
-        using var activity = _activitySource.StartActivity("Statement.Execute");
-        activity?.SetTag("statement.id", statementId);
-        activity?.SetTag("session.id", "test-session");
-        activity?.SetTag("result.ready_latency_ms", 150L);
-        activity?.SetTag("result.consumption_latency_ms", 3000L);
-        activity?.Stop();
-
-        // Act
-        _aggregator.ProcessActivity(activity!);
-        _aggregator.CompleteStatement(statementId);
-        _aggregator.FlushAsync().Wait();
-
-        // Assert
-        var proto = DeserializeProto(_mockExporter.ExportedLogs.First());
-        Assert.Equal(150, proto.SqlOperation.ResultLatency.ResultSetReadyLatencyMillis);
-        Assert.Equal(3000, proto.SqlOperation.ResultLatency.ResultSetConsumptionLatencyMillis);
-    }
-
-    [Fact]
-    public void OperationDetail_MapsCorrectly()
-    {
-        // Arrange
-        var statementId = Guid.NewGuid().ToString("N");
-        using var activity = _activitySource.StartActivity("Statement.Execute");
-        activity?.SetTag("statement.id", statementId);
-        activity?.SetTag("session.id", "test-session");
-        activity?.SetTag("poll.count", 5);
-        activity?.SetTag("poll.latency_ms", 500L);
-        activity?.SetTag("operation.type", "execute_statement");
-        activity?.SetTag("operation.is_internal", false);
-        activity?.Stop();
-
-        // Act
-        _aggregator.ProcessActivity(activity!);
-        _aggregator.CompleteStatement(statementId);
-        _aggregator.FlushAsync().Wait();
-
-        // Assert
-        var proto = DeserializeProto(_mockExporter.ExportedLogs.First());
-        Assert.Equal(5, proto.SqlOperation.OperationDetail.NOperationStatusCalls);
-        Assert.Equal(500, proto.SqlOperation.OperationDetail.OperationStatusLatencyMillis);
-        Assert.False(proto.SqlOperation.OperationDetail.IsInternalCall);
-    }
-}
-```
-
-#### 10.5.5 Unit Tests - DriverErrorInfo
-
-**File**: `test/Unit/Telemetry/ProtoPopulation/DriverErrorInfoTests.cs`
-
-```csharp
-public class DriverErrorInfoTests : IDisposable
-{
-    [Fact]
-    public void ErrorName_MapsFromExceptionType()
-    {
-        // Arrange
-        var statementId = Guid.NewGuid().ToString("N");
-        using var activity = _activitySource.StartActivity("Statement.Execute");
-        activity?.SetTag("statement.id", statementId);
-        activity?.SetTag("session.id", "test-session");
-        activity?.SetTag("error.type", "HttpRequestException");
-        activity?.SetStatus(ActivityStatusCode.Error, "Connection refused");
-        activity?.Stop();
-
-        // Act
-        _aggregator.ProcessActivity(activity!);
-        _aggregator.FlushAsync().Wait();
-
-        // Assert
-        var proto = DeserializeProto(_mockExporter.ExportedLogs.First());
-        Assert.Equal("HttpRequestException", proto.ErrorInfo.ErrorName);
-    }
-
-    [Fact]
-    public void ErrorMessage_TruncatedTo200Chars()
-    {
-        // Arrange
-        var longMessage = new string('x', 500); // 500 chars
-        var statementId = Guid.NewGuid().ToString("N");
-        using var activity = _activitySource.StartActivity("Statement.Execute");
-        activity?.SetTag("statement.id", statementId);
-        activity?.SetTag("error.type", "TestException");
-        activity?.SetStatus(ActivityStatusCode.Error, longMessage);
-        activity?.Stop();
-
-        // Act
-        _aggregator.ProcessActivity(activity!);
-        _aggregator.FlushAsync().Wait();
-
-        // Assert
-        var proto = DeserializeProto(_mockExporter.ExportedLogs.First());
-        Assert.Equal(200, proto.ErrorInfo.StackTrace.Length);
-    }
-}
-```
-
-#### 10.5.6 Schema Validation Tests
-
-**File**: `test/Unit/Telemetry/ProtoPopulation/ProtoSchemaValidationTests.cs`
-
-```csharp
-public class ProtoSchemaValidationTests
-{
-    [Fact]
-    public void AllProtoFields_HaveCorrespondingActivityTags()
-    {
-        // This test ensures we don't miss mapping any proto fields
-        var protoFields = GetAllProtoFieldPaths<OssSqlDriverTelemetryLog>();
-        var documentedTags = GetDocumentedActivityTags();
-
-        foreach (var field in protoFields)
-        {
-            // Skip intentionally unmapped fields
-            if (IsIntentionallyUnmapped(field)) continue;
-
-            Assert.True(documentedTags.ContainsKey(field),
-                $"Proto field '{field}' has no documented Activity tag mapping");
-        }
-    }
-
-    [Fact]
-    public void Proto_BinaryRoundtrip_PreservesAllFields()
-    {
-        // Arrange - create proto with ALL fields populated
-        var original = CreateFullyPopulatedProto();
-
-        // Act - serialize and deserialize
-        var bytes = original.ToByteArray();
-        var deserialized = OssSqlDriverTelemetryLog.Parser.ParseFrom(bytes);
-
-        // Assert - all fields preserved
-        Assert.Equal(original.SessionId, deserialized.SessionId);
-        Assert.Equal(original.SqlStatementId, deserialized.SqlStatementId);
-        Assert.Equal(original.AuthType, deserialized.AuthType);
-        Assert.Equal(original.OperationLatencyMs, deserialized.OperationLatencyMs);
-
-        // SystemConfiguration
-        Assert.Equal(original.SystemConfiguration.DriverVersion,
-            deserialized.SystemConfiguration.DriverVersion);
-        Assert.Equal(original.SystemConfiguration.OsName,
-            deserialized.SystemConfiguration.OsName);
-        // ... assert all fields ...
-
-        // ChunkDetails
-        Assert.Equal(original.SqlOperation.ChunkDetails.InitialChunkLatencyMillis,
-            deserialized.SqlOperation.ChunkDetails.InitialChunkLatencyMillis);
-        // ... assert all fields ...
-    }
-
-    [Fact]
-    public void Proto_JsonRoundtrip_PreservesAllFields()
-    {
-        // Arrange
-        var original = CreateFullyPopulatedProto();
-
-        // Act
-        var json = JsonFormatter.Default.Format(original);
-        var deserialized = JsonParser.Default.Parse<OssSqlDriverTelemetryLog>(json);
-
-        // Assert - same as binary roundtrip
-        Assert.Equal(original.SessionId, deserialized.SessionId);
-        // ...
-    }
-
-    private static OssSqlDriverTelemetryLog CreateFullyPopulatedProto()
-    {
-        return new OssSqlDriverTelemetryLog
-        {
-            SessionId = "test-session-123",
-            SqlStatementId = "stmt-456",
-            AuthType = "pat",
-            OperationLatencyMs = 1500,
-            SystemConfiguration = new DriverSystemConfiguration
-            {
-                DriverName = "Databricks ADBC Driver",
-                DriverVersion = "1.0.0",
-                RuntimeName = ".NET",
-                RuntimeVersion = "8.0.0",
-                RuntimeVendor = "Microsoft",
-                OsName = "Windows 10",
-                OsVersion = "10.0.19041",
-                OsArch = "X64",
-                ClientAppName = "TestApp",
-                LocaleName = "en-US",
-                CharSetEncoding = "utf-8",
-                ProcessName = "dotnet"
-            },
-            DriverConnectionParams = new DriverConnectionParameters
-            {
-                HttpPath = "/sql/1.0/warehouses/abc123",
-                Mode = DriverModeType.DriverModeThrift,
-                HostInfo = new HostDetails { HostUrl = "test.cloud.databricks.com", Port = 443 },
-                AuthMech = DriverAuthMechType.DriverAuthMechPat,
-                EnableArrow = true,
-                EnableDirectResults = true,
-                RowsFetchedPerBlock = 2000000,
-                AsyncPollIntervalMillis = 100
-            },
-            SqlOperation = new SqlExecutionEvent
-            {
-                StatementType = StatementType.StatementQuery,
-                IsCompressed = true,
-                ExecutionResult = ExecutionResultFormat.ExecutionResultExternalLinks,
-                RetryCount = 0,
-                ChunkDetails = new ChunkDetails
-                {
-                    TotalChunksPresent = 10,
-                    TotalChunksIterated = 10,
-                    SumChunksDownloadTimeMillis = 5000,
-                    InitialChunkLatencyMillis = 100,
-                    SlowestChunkLatencyMillis = 800
-                },
-                ResultLatency = new ResultLatency
-                {
-                    ResultSetReadyLatencyMillis = 150,
-                    ResultSetConsumptionLatencyMillis = 3000
-                },
-                OperationDetail = new OperationDetail
-                {
-                    NOperationStatusCalls = 5,
-                    OperationStatusLatencyMillis = 500,
-                    OperationType = OperationType.OperationExecuteStatement,
-                    IsInternalCall = false
-                }
-            }
-        };
-    }
-}
-```
-
-#### 10.5.7 Integration Tests - End-to-End Proto Population
-
-**File**: `test/E2E/Telemetry/ProtoPopulationE2ETests.cs`
-
-```csharp
-[Collection("Databricks")]
-public class ProtoPopulationE2ETests : IClassFixture<DatabricksTestEnvironment>
-{
-    private readonly DatabricksTestEnvironment _env;
-
-    [SkippableFact]
-    public async Task RealConnection_PopulatesSystemConfiguration()
-    {
-        Skip.IfNot(_env.CanConnect, "No connection available");
-
-        // Arrange
-        var capturedLogs = new List<TelemetryFrontendLog>();
-        var mockExporter = new CapturingTelemetryExporter(capturedLogs);
-
-        // Act
-        using var connection = await CreateConnectionWithTelemetry(mockExporter);
-
-        // Assert
-        Assert.NotEmpty(capturedLogs);
-        var proto = DeserializeProto(capturedLogs.First());
-
-        // Verify system config is populated with real values
-        Assert.NotEmpty(proto.SystemConfiguration.DriverVersion);
-        Assert.NotEmpty(proto.SystemConfiguration.OsName);
-        Assert.NotEmpty(proto.SystemConfiguration.RuntimeVersion);
-        Assert.Contains(".NET", proto.SystemConfiguration.RuntimeName);
-    }
-
-    [SkippableFact]
-    public async Task RealQuery_PopulatesChunkDetails()
-    {
-        Skip.IfNot(_env.CanConnect, "No connection available");
-
-        // Arrange
-        var capturedLogs = new List<TelemetryFrontendLog>();
-
-        // Act
-        using var connection = await CreateConnectionWithTelemetry(
-            new CapturingTelemetryExporter(capturedLogs));
-
-        // Execute a query that returns multiple chunks (large result)
-        using var statement = connection.CreateStatement();
-        statement.SqlQuery = "SELECT * FROM samples.nyctaxi.trips LIMIT 100000";
-        using var reader = await statement.ExecuteQueryAsync();
-        while (await reader.ReadNextRecordBatchAsync() != null) { }
-
-        // Assert
-        var statementLog = capturedLogs
-            .Select(DeserializeProto)
-            .FirstOrDefault(p => !string.IsNullOrEmpty(p.SqlStatementId));
-
-        Assert.NotNull(statementLog);
-        Assert.True(statementLog.SqlOperation.ChunkDetails.TotalChunksPresent > 0);
-        Assert.True(statementLog.SqlOperation.ChunkDetails.InitialChunkLatencyMillis > 0);
-    }
-
-    [SkippableFact]
-    public async Task RealQuery_PopulatesPollingMetrics()
-    {
-        Skip.IfNot(_env.CanConnect, "No connection available");
-
-        // Arrange & Act
-        var capturedLogs = new List<TelemetryFrontendLog>();
-        using var connection = await CreateConnectionWithTelemetry(
-            new CapturingTelemetryExporter(capturedLogs));
-
-        // Execute a long-running query that requires polling
-        using var statement = connection.CreateStatement();
-        statement.SqlQuery = "SELECT COUNT(*) FROM samples.nyctaxi.trips";
-        using var reader = await statement.ExecuteQueryAsync();
-        await reader.ReadNextRecordBatchAsync();
-
-        // Assert
-        var proto = capturedLogs
-            .Select(DeserializeProto)
-            .First(p => !string.IsNullOrEmpty(p.SqlStatementId));
-
-        // Should have at least 1 poll call
-        Assert.True(proto.SqlOperation.OperationDetail.NOperationStatusCalls >= 1);
-        Assert.True(proto.SqlOperation.OperationDetail.OperationStatusLatencyMillis >= 0);
-    }
-}
-```
-
-#### 10.5.8 Test Utilities
-
-**File**: `test/Unit/Telemetry/TestUtilities/TelemetryTestHelpers.cs`
-
-```csharp
-internal static class TelemetryTestHelpers
-{
-    public static OssSqlDriverTelemetryLog DeserializeProto(TelemetryFrontendLog log)
-    {
-        var json = log.Entry;
-        return JsonParser.Default.Parse<OssSqlDriverTelemetryLog>(json);
-    }
-
-    public static Activity CreateConnectionActivity(ActivitySource source, string sessionId)
-    {
-        var activity = source.StartActivity("Connection.Open");
-        activity?.SetTag("session.id", sessionId);
-        return activity!;
-    }
-
-    public static Activity CreateStatementActivity(
-        ActivitySource source, string statementId, string sessionId)
-    {
-        var activity = source.StartActivity("Statement.Execute");
-        activity?.SetTag("statement.id", statementId);
-        activity?.SetTag("session.id", sessionId);
-        return activity!;
-    }
-
-    public static void AddCloudFetchSummaryEvent(
-        Activity activity, int totalFiles, int successful, long totalTimeMs,
-        long initialLatencyMs, long slowestLatencyMs)
-    {
-        activity.AddEvent(new ActivityEvent("cloudfetch.download_summary",
-            tags: new ActivityTagsCollection
-            {
-                { "total_files", totalFiles },
-                { "successful_downloads", successful },
-                { "total_time_ms", totalTimeMs },
-                { "initial_chunk_latency_ms", initialLatencyMs },
-                { "slowest_chunk_latency_ms", slowestLatencyMs }
-            }));
-    }
-}
-
-internal class CapturingTelemetryExporter : ITelemetryExporter
-{
-    private readonly List<TelemetryFrontendLog> _capturedLogs;
-
-    public CapturingTelemetryExporter(List<TelemetryFrontendLog> capturedLogs)
-    {
-        _capturedLogs = capturedLogs;
-    }
-
-    public Task<bool> ExportAsync(
-        IReadOnlyList<TelemetryFrontendLog> logs, CancellationToken ct = default)
-    {
-        _capturedLogs.AddRange(logs);
-        return Task.FromResult(true);
-    }
-}
-```
-
-#### 10.5.9 Test Execution Commands
-
-```bash
-# Run all proto population unit tests
-dotnet test --filter "FullyQualifiedName~ProtoPopulation"
-
-# Run specific test category
-dotnet test --filter "FullyQualifiedName~DriverSystemConfigurationTests"
-dotnet test --filter "FullyQualifiedName~SqlExecutionEventTests"
-
-# Run with coverage
-dotnet test --filter "FullyQualifiedName~ProtoPopulation" \
-    /p:CollectCoverage=true \
-    /p:CoverletOutputFormat=lcov
-
-# Run E2E tests (requires Databricks connection)
-DATABRICKS_HOST=xxx DATABRICKS_TOKEN=xxx \
-    dotnet test --filter "FullyQualifiedName~ProtoPopulationE2ETests"
-```
-
-#### 10.5.10 Test Coverage Matrix for Proto Fields
-
-| Proto Message | Field | Unit Test | E2E Test |
-|---------------|-------|-----------|----------|
-| **OssSqlDriverTelemetryLog** | | | |
-| | session_id | ✅ | ✅ |
-| | sql_statement_id | ✅ | ✅ |
-| | auth_type | ✅ | ✅ |
-| | operation_latency_ms | ✅ | ✅ |
-| **DriverSystemConfiguration** | | | |
-| | driver_name | ✅ | ✅ |
-| | driver_version | ✅ | ✅ |
-| | runtime_name | ✅ | ✅ |
-| | runtime_version | ✅ | ✅ |
-| | runtime_vendor | ✅ | - |
-| | os_name | ✅ | ✅ |
-| | os_version | ✅ | - |
-| | os_arch | ✅ | - |
-| | client_app_name | ✅ | - |
-| | locale_name | ✅ | - |
-| | char_set_encoding | ✅ | - |
-| | process_name | ✅ | - |
-| **DriverConnectionParameters** | | | |
-| | http_path | ✅ | ✅ |
-| | mode | ✅ | ✅ |
-| | auth_mech | ✅ | ✅ |
-| | auth_flow | ✅ | - |
-| | enable_arrow | ✅ | ✅ |
-| | enable_direct_results | ✅ | ✅ |
-| | rows_fetched_per_block | ✅ | - |
-| | async_poll_interval_millis | ✅ | - |
-| **SqlExecutionEvent** | | | |
-| | statement_type | ✅ | ✅ |
-| | is_compressed | ✅ | ✅ |
-| | execution_result | ✅ | ✅ |
-| | retry_count | ✅ | - |
-| **ChunkDetails** | | | |
-| | total_chunks_present | ✅ | ✅ |
-| | total_chunks_iterated | ✅ | ✅ |
-| | sum_chunks_download_time_millis | ✅ | ✅ |
-| | initial_chunk_latency_millis | ✅ | ✅ |
-| | slowest_chunk_latency_millis | ✅ | ✅ |
-| **ResultLatency** | | | |
-| | result_set_ready_latency_millis | ✅ | - |
-| | result_set_consumption_latency_millis | ✅ | - |
-| **OperationDetail** | | | |
-| | n_operation_status_calls | ✅ | ✅ |
-| | operation_status_latency_millis | ✅ | ✅ |
-| | operation_type | ✅ | - |
-| | is_internal_call | ✅ | - |
-| **DriverErrorInfo** | | | |
-| | error_name | ✅ | - |
-| | stack_trace | ✅ | - |
+### 10.2 E2E Test Scenarios
+
+Each test creates a real connection with a `CapturingTelemetryExporter`, executes a specific scenario, and validates the captured proto fields.
+
+#### Scenario 1: Simple inline query (SELECT 1)
+
+| Aspect | Details |
+|--------|---------|
+| **Setup** | Standard connection, telemetry enabled |
+| **Action** | `SELECT 1 AS test_value` — small result, no CloudFetch |
+| **Expected proto fields** | |
+| `session_id` | Non-empty |
+| `sql_statement_id` | Non-empty |
+| `system_configuration` | All 12 fields populated |
+| `driver_connection_params` | `http_path`, `host_info`, `mode=THRIFT`, `auth_mech`, `auth_flow` populated |
+| `auth_type` | `"pat"` or `"oauth"` (not `"unknown"`) |
+| `sql_operation.statement_type` | `STATEMENT_QUERY` |
+| `sql_operation.execution_result` | `EXECUTION_RESULT_INLINE_ARROW` or `EXECUTION_RESULT_EXTERNAL_LINKS` |
+| `sql_operation.result_latency` | `result_set_ready_latency_millis > 0` |
+| `sql_operation.operation_detail.operation_type` | `OPERATION_EXECUTE_STATEMENT` |
+| `operation_latency_ms` | > 0 |
+| `error_info` | Not present |
+| **Emission count** | Exactly 1 |
+
+#### Scenario 2: CloudFetch query (large result set)
+
+| Aspect | Details |
+|--------|---------|
+| **Setup** | Connection with CloudFetch enabled, query returns enough data for external links |
+| **Action** | Query that produces multiple CloudFetch chunks (e.g., `SELECT * FROM large_table LIMIT 100000`) |
+| **Expected proto fields** | |
+| `sql_operation.execution_result` | `EXECUTION_RESULT_EXTERNAL_LINKS` |
+| `sql_operation.is_compressed` | `true` (if LZ4 enabled) |
+| `sql_operation.chunk_details.total_chunks_present` | > 0 |
+| `sql_operation.chunk_details.total_chunks_iterated` | > 0 |
+| `sql_operation.chunk_details.initial_chunk_latency_millis` | > 0 |
+| `sql_operation.chunk_details.slowest_chunk_latency_millis` | > 0 |
+| `sql_operation.chunk_details.sum_chunks_download_time_millis` | > 0 |
+| `sql_operation.result_latency.result_set_ready_latency_millis` | > 0 |
+| `sql_operation.result_latency.result_set_consumption_latency_millis` | > 0 |
+| **Emission count** | Exactly 1 |
+
+#### Scenario 3: Query with polling (async execution)
+
+| Aspect | Details |
+|--------|---------|
+| **Setup** | Standard connection, query that requires server-side polling (not direct results) |
+| **Action** | Query that takes long enough to require polling (or disable direct results) |
+| **Expected proto fields** | |
+| `sql_operation.operation_detail.n_operation_status_calls` | > 0 |
+| `sql_operation.operation_detail.operation_status_latency_millis` | > 0 |
+| `sql_operation.operation_detail.operation_type` | `OPERATION_EXECUTE_STATEMENT` |
+| **Emission count** | Exactly 1 |
+
+#### Scenario 4: SQL error (invalid query)
+
+| Aspect | Details |
+|--------|---------|
+| **Setup** | Standard connection, telemetry enabled |
+| **Action** | `SELECT FROM NONEXISTENT_TABLE_XYZ` — intentionally invalid SQL |
+| **Expected proto fields** | |
+| `session_id` | Non-empty (connection still valid) |
+| `sql_statement_id` | May or may not be populated (depends on when error occurs) |
+| `error_info.error_name` | Non-empty, contains exception type |
+| `error_info.stack_trace` | Non-empty, contains error message |
+| `operation_latency_ms` | > 0 (time spent before error) |
+| `sql_operation` | May be partial or absent |
+| **Emission count** | Exactly 1 |
+
+#### Scenario 5: Metadata operation (GetCatalogs)
+
+| Aspect | Details |
+|--------|---------|
+| **Setup** | Standard connection, telemetry enabled |
+| **Action** | `connection.GetInfo()` or `connection.GetTableTypes()` |
+| **Expected proto fields** | |
+| `sql_operation.statement_type` | `STATEMENT_METADATA` |
+| `sql_operation.operation_detail.operation_type` | `OPERATION_LIST_CATALOGS` (or similar) |
+| `operation_latency_ms` | > 0 |
+| **Emission count** | Exactly 1 |
+
+#### Scenario 6: Multiple statements on same connection
+
+| Aspect | Details |
+|--------|---------|
+| **Setup** | Single connection, telemetry enabled |
+| **Action** | Execute 3 separate queries sequentially |
+| **Expected proto fields** | |
+| All 3 logs have same `session_id` | Connection-level correlation |
+| All 3 logs have different `sql_statement_id` | Unique per statement |
+| All 3 logs have `system_configuration` | Identical across all (from session context) |
+| All 3 logs have `driver_connection_params` | Identical across all (from session context) |
+| **Emission count** | Exactly 3 |
+
+#### Scenario 7: Telemetry disabled via feature flag
+
+| Aspect | Details |
+|--------|---------|
+| **Setup** | Connection with `telemetry.enabled=false` |
+| **Action** | Execute any query |
+| **Expected** | No telemetry logs captured |
+| **Emission count** | 0 |
+
+#### Scenario 8: ExecuteUpdate (INSERT/CREATE)
+
+| Aspect | Details |
+|--------|---------|
+| **Setup** | Standard connection, telemetry enabled |
+| **Action** | `CREATE TABLE temp_test (id INT)` or `INSERT INTO ...` |
+| **Expected proto fields** | |
+| `sql_operation.statement_type` | `STATEMENT_UPDATE` |
+| `sql_operation.operation_detail.operation_type` | `OPERATION_EXECUTE_STATEMENT` |
+| `operation_latency_ms` | > 0 |
+| **Emission count** | Exactly 1 |
+
+---
+
+### 10.3 Unit Tests
+
+**StatementTelemetryContext Tests**:
+- `BuildTelemetryLog_AllFieldsPopulated_ProtoComplete` — set every field, verify proto output
+- `BuildTelemetryLog_MinimalFields_NoNullRefs` — only session context, no crash
+- `BuildTelemetryLog_ErrorPath_IncludesErrorInfo`
+- `BuildTelemetryLog_CloudFetch_IncludesChunkDetails`
+- `BuildTelemetryLog_WithPolling_IncludesOperationDetail`
+- `BuildTelemetryLog_WithResultLatency_IncludesResultLatency`
+- `Timing_StopwatchCalculatesLatency` — verify `FirstBatchReadyMs`, `ResultsConsumedMs`
+
+**DatabricksStatement Telemetry Base Tests**:
+- `CreateTelemetryContext_CopiesSessionContext`
+- `EmitTelemetry_EnqueuesToClient`
+- `EmitTelemetry_NullClient_NoOp`
+- `RecordError_SetsErrorFields`
+- `EmitTelemetry_CalledOnce_NoDuplicates`
+
+**Export Pipeline Tests** (unchanged):
+- `TelemetryClient_BatchesAndFlushes`
+- `TelemetryClientManager_OneClientPerHost`
+- `TelemetryClientManager_RefCountingWorks`
+- `CircuitBreaker_OpensAfterFailures`
+- `CircuitBreaker_ClosesAfterSuccesses`
+- `ExceptionClassifier_IdentifiesTerminal`
+- `FeatureFlagCache_CachesPerHost`
+
+### 10.4 Test Coverage Goals
+
+| Component | Unit Test Coverage | E2E Test Coverage |
+|-----------|-------------------|-------------------|
+| StatementTelemetryContext | > 90% | Covered by scenarios |
+| DatabricksStatement (telemetry base) | > 90% | Covered by scenarios |
+| Proto field population | **100%** (every field verified) | **100%** (every field in at least one scenario) |
+| TelemetryClient / Manager | > 90% | > 80% |
+| CircuitBreaker | > 90% | > 80% |
+| ExceptionClassifier | 100% | N/A |
 
 ---
 
@@ -5051,158 +2667,121 @@ DATABRICKS_HOST=xxx DATABRICKS_TOKEN=xxx \
 
 ---
 
-### 11.4 Why Activity-Based Approach Was Chosen
+### 11.4 Why Activity-Based Approach Was Replaced (V2 → V3)
 
-The Activity-based design was selected because it:
+The V2 Activity-based design was initially chosen to avoid duplicate instrumentation, but implementation revealed fundamental complexity issues:
 
-**1. Leverages Existing Infrastructure**
-- Driver already has comprehensive Activity instrumentation
-- No new instrumentation points needed
-- Reuses Activity's built-in timing and correlation
+| Problem | Root Cause | Impact |
+|---------|-----------|--------|
+| **Activity ordering** | Child activities stop before parent; reader activities stop after Execute emits | Premature emission with incomplete data |
+| **Tag propagation** | .NET Activity tags NOT inherited by children | Every activity needs manual `session.id` + `statement.id` propagation |
+| **Operation name matching** | `MergeFrom` routes by string matching on operation names | Fragile — breaks when names change |
+| **Multiple emissions** | Non-Execute root activities (ReadNextRecordBatch, Dispose) trigger duplicate emissions | Required `_emittedStatementIds` tracking hack |
+| **Result latency gap** | Reader Dispose fires after Execute activity already emitted | Cannot capture `result_set_consumption_latency_ms` |
+| **Global listener** | `ActivityListener` is global, receives ALL activities from ALL connections | Complex session-based routing needed |
 
-**2. Single Source of Truth**
-- Activity serves as the data model for both traces and metrics
-- Automatic correlation between distributed traces and telemetry metrics
-- Consistent data across all observability signals
+### 11.5 Why Direct Object Approach Was Chosen (V3)
 
-**3. Minimal Code Changes**
-- Only requires adding tags to existing activities
-- No duplicate instrumentation code
-- Lower maintenance burden
+The V3 direct object design addresses all V2 issues:
 
-**4. Standards-Based**
-- Activity is .NET's standard distributed tracing API
-- Works seamlessly with OpenTelemetry ecosystem
-- Compatible with existing APM tools
-
-**5. Performance Efficient**
-- ActivityListener has minimal overhead
-- No duplicate timing or data collection
-- Non-blocking by design
-
-**6. Simplicity**
-- Easier to understand (one system vs two)
-- Easier to test (single instrumentation path)
-- Easier to maintain (single codebase)
+| Aspect | V2: Activity-Based | V3: Direct Object |
+|--------|-------------------|-------------------|
+| **Data flow** | Activity → tags → Listener → Aggregator → Context → Proto | Statement → Context → Proto |
+| **Routing** | Global listener routes by `session.id` tag | Direct object reference on statement |
+| **Tag propagation** | Every child activity needs `session.id` + `statement.id` | Not needed |
+| **Emit trigger** | Root activity completion (fragile ordering) | Reader dispose or error catch (deterministic) |
+| **Result latency** | Cannot capture (reader disposes after emit) | Trivial (reader holds context reference) |
+| **Duplicate handling** | `_emittedStatementIds` tracking needed | Impossible by design (one emit point) |
+| **Thread safety** | ConcurrentDictionary, locks in aggregator | Single-threaded per statement |
+| **Testability** | Need mock ActivitySource, listener wiring | Create context → set fields → assert |
+| **Lines of code** | ~800 (Listener + Aggregator + tag propagation) | ~200 (context creation + inline sets) |
 
 **Trade-offs Accepted**:
-- Coupling to Activity API (acceptable - it's .NET standard)
-- Activity tag size limits (adequate for our metrics needs)
-- Requires understanding Activity API (but provides better developer experience overall)
+- Activity infrastructure remains for OpenTelemetry distributed tracing (unchanged)
+- Telemetry collection is separate from tracing (but this is actually simpler)
+- Slight code duplication at instrumentation points (but explicit and easy to understand)
 
 ---
 
 ## 12. Implementation Checklist
 
-### Phase 1: Feature Flag Cache & Per-Host Management
-- [ ] Create `FeatureFlagCache` singleton with per-host contexts (in `Apache.Arrow.Adbc.Drivers.Databricks` namespace, not Telemetry)
-- [ ] Make cache generic - return all flags, not just telemetry-specific ones
-- [ ] Implement `FeatureFlagContext` with reference counting
-- [ ] Implement `GetFlagValue(string)` and `GetAllFlags()` methods for generic flag access
-- [ ] Implement API call to `/api/2.0/connector-service/feature-flags/OSS_JDBC/{version}` (use JDBC endpoint initially)
-- [ ] Parse `FeatureFlagsResponse` with `flags` array and `ttl_seconds`
-- [ ] Implement initial blocking fetch on context creation
-- [ ] Implement background refresh scheduler using server-provided `ttl_seconds`
-- [ ] Add `Shutdown()` method to stop scheduler and cleanup
-- [ ] Implement configuration priority: user properties > feature flags > driver defaults
-- [ ] Create `TelemetryClientManager` singleton
-- [ ] Implement `TelemetryClientHolder` with reference counting
-- [ ] Add unit tests for cache behavior and reference counting
-- [ ] Add unit tests for background refresh scheduling
-- [ ] Add unit tests for configuration priority order
+### Phase 1: Infrastructure — already implemented
+- [x] `FeatureFlagCache` — per-host caching with background refresh
+- [x] `FeatureFlagContext` — reference counting, initial blocking fetch, TTL-based refresh
+- [x] `CircuitBreaker` — state machine (Closed → Open → Half-Open)
+- [x] `DatabricksTelemetryExporter` — HTTP POST to `/telemetry-ext` and `/telemetry-unauth`
+- [x] `ITelemetryExporter` — exporter interface
+- [x] `ExceptionClassifier` — terminal vs retryable classification
+- [x] `TelemetryConfiguration` — config model with feature flag support
+- [x] `ProtoJsonConverter` — proto ↔ JSON serialization
+- [x] Proto file (`sql_driver_telemetry.proto`) and generated C# types
+- [x] Models (`TelemetryFrontendLog`, `FrontendLogEntry`, `FrontendLogContext`, `TelemetryClientContext`, `TelemetryRequest`)
+- [x] `TagDefinitions/` — tag name constants (to be simplified in Phase 6)
 
-**Code Guidelines**:
-- Avoid `#if` preprocessor directives - write code compatible with all target .NET versions (netstandard2.0, net472, net8.0)
-- Use polyfills or runtime checks instead of compile-time conditionals where needed
+### Phase 2: Export pipeline — not yet implemented
+- [ ] `ITelemetryClient` — interface: `Enqueue(log)`, `FlushAsync()`, `CloseAsync()`
+- [ ] `TelemetryClient` — batching queue with periodic flush timer
+- [ ] `TelemetryClientManager` — singleton, per-host client with reference counting
+- [ ] `TelemetryClientHolder` — holds client + ref count
+- [ ] `CircuitBreakerManager` — singleton, per-host circuit breakers
+- [ ] `CircuitBreakerTelemetryExporter` — wraps `ITelemetryExporter` with circuit breaker
+- [ ] Fix JSON serialization — use `WithPreserveProtoFieldNames(true)` for snake_case (Section 5.4)
 
-### Phase 2: Circuit Breaker
-- [ ] Create `CircuitBreaker` class with state machine
-- [ ] Create `CircuitBreakerManager` singleton (per-host breakers)
-- [ ] Create `CircuitBreakerTelemetryExporter` wrapper
-- [ ] Configure failure thresholds and timeouts
-- [ ] Add DEBUG logging for state transitions
-- [ ] Add unit tests for circuit breaker logic
+### Phase 3: Direct collection (V3) — not yet implemented
+- [ ] `TelemetrySessionContext` — frozen session-level data built at connection open
+- [ ] `StatementTelemetryContext` — per-statement data container with `Stopwatch` and `BuildTelemetryLog()`
+- [ ] Shared `DatabricksStatement` telemetry base:
+  - [ ] `CreateTelemetryContext()` — creates context from session context
+  - [ ] `EmitTelemetry()` — builds proto, wraps in FrontendLog, enqueues to client
+  - [ ] `RecordError(Exception)` — records error info on context
+- [ ] `DatabricksConnection.InitializeTelemetry()` — build `TelemetrySessionContext`, get shared `ITelemetryClient`
+- [ ] `DatabricksConnection.Dispose()` — flush-before-close with timeout (Section 9.4)
 
-### Phase 3: Exception Handling
-- [ ] Create `ExceptionClassifier` for terminal vs retryable
-- [ ] Update `MetricsAggregator` to buffer retryable exceptions
-- [ ] Implement immediate flush for terminal exceptions
-- [ ] Wrap all telemetry code in try-catch blocks
-- [ ] Replace all logging with TRACE/DEBUG levels only
-- [ ] Ensure circuit breaker sees exceptions before swallowing
-- [ ] Add unit tests for exception classification
+### Phase 4: Thrift protocol instrumentation
+- [ ] `DatabricksStatement.SetStatementProperties()` — set `StatementType`, `ResultFormat`, `IsCompressed`, `OperationType`
+- [ ] `HiveServer2Statement.ExecuteStatementAsync()` — set `StatementId` from server response
+- [ ] `HiveServer2Connection.PollForResponseAsync()` — set `PollCount`, `PollLatencyMs`
+- [ ] `DatabricksCompositeReader` — record `FirstBatchReadyMs`, `ResultsConsumedMs`, chunk details
+- [ ] Emit on reader dispose (success) or catch block (error)
 
-### Phase 4: Tag Definition System
-- [ ] Create `TagDefinitions/TelemetryTag.cs` (attribute and enums)
-- [ ] Create `TagDefinitions/ConnectionOpenEvent.cs` (connection tag definitions)
-- [ ] Create `TagDefinitions/StatementExecutionEvent.cs` (statement tag definitions)
-- [ ] Create `TagDefinitions/ErrorEvent.cs` (error tag definitions)
-- [ ] Create `TagDefinitions/TelemetryTagRegistry.cs` (central registry)
-- [ ] Add unit tests for tag registry
+### Phase 5: SEA protocol instrumentation
+- [ ] `SeaStatement.ExecuteAsync()` — set `StatementType`, `ResultFormat`, `OperationType`, `StatementId`
+- [ ] `SeaStatement.PollAsync()` — set `PollCount`, `PollLatencyMs`
+- [ ] `SeaReader` — record `FirstBatchReadyMs`, `ResultsConsumedMs`, chunk details
+- [ ] Emit on reader dispose (success) or catch block (error)
+- [ ] Set `DriverConnectionParams.Mode = DRIVER_MODE_SEA`
 
-### Phase 5: Core Implementation
-- [ ] Create `DatabricksActivityListener` class
-- [ ] Create `MetricsAggregator` class (with exception buffering)
-- [x] Create `DatabricksTelemetryExporter` class (WI-3.4)
-- [ ] Add necessary tags to existing activities (using defined constants)
-- [ ] Update connection to use per-host management
-
-### Phase 6: Integration
-- [ ] Update `DatabricksConnection.OpenAsync()` to use managers
-- [ ] Implement graceful shutdown in `DatabricksConnection.CloseAsync()`
-- [ ] Add configuration parsing from connection string
-- [ ] Wire up feature flag cache
+### Phase 6: Cleanup
+- [ ] Simplify `TagDefinitions/` — remove `TelemetryTag` attribute, `TagExportScope`, `TelemetryTagRegistry`, `TelemetryEventType`; keep plain `const string` values
+- [ ] Remove any V2 Activity tag propagation code if present
 
 ### Phase 7: Testing
-- [ ] Unit tests for all new components
-- [ ] Integration tests for per-host management
-- [ ] Integration tests for circuit breaker
-- [ ] Integration tests for graceful shutdown
-- [ ] Performance tests (overhead measurement)
-- [ ] Load tests with many concurrent connections
+- [ ] Unit tests: `StatementTelemetryContext.BuildTelemetryLog()` — every proto field verified (Section 10.1)
+- [ ] Unit tests: `DatabricksStatement` base — `CreateTelemetryContext`, `EmitTelemetry`, `RecordError`
+- [ ] Unit tests: `TelemetryClient` — batching, flush, close
+- [ ] Unit tests: `TelemetryClientManager` — per-host sharing, reference counting
+- [ ] Unit tests: `CircuitBreakerTelemetryExporter` — open/close/half-open
+- [ ] E2E Scenario 1: Simple inline query — all top-level fields populated (Section 10.2)
+- [ ] E2E Scenario 2: CloudFetch query — `chunk_details` fully populated
+- [ ] E2E Scenario 3: Query with polling — `operation_detail` populated
+- [ ] E2E Scenario 4: SQL error — `error_info` populated
+- [ ] E2E Scenario 5: Metadata operation — `statement_type = METADATA`
+- [ ] E2E Scenario 6: Multiple statements — same `session_id`, different `sql_statement_id`
+- [ ] E2E Scenario 7: Telemetry disabled — 0 emissions
+- [ ] E2E Scenario 8: ExecuteUpdate — `statement_type = UPDATE`
+- [ ] Verify snake_case JSON field names match JDBC output
+- [ ] Verify flush-before-close guarantee (logs sent before dispose returns)
 
-### Phase 8: Documentation
-- [ ] Update Activity instrumentation docs
-- [ ] Document new activity tags
-- [ ] Update configuration guide
-- [ ] Add troubleshooting guide
+**Code Guidelines**:
+- Avoid `#if` preprocessor directives — write code compatible with all target .NET versions (netstandard2.0, net472, net8.0)
+- Use polyfills or runtime checks instead of compile-time conditionals where needed
+- All telemetry code wrapped in try-catch — never impact driver operations
 
 ---
 
 ## 13. Open Questions
 
-### 13.1 Activity Tag Naming Conventions
-
-**Question**: Should we use OpenTelemetry semantic conventions for tag names?
-
-**Recommendation**: Yes, use OTEL conventions where applicable:
-- `db.statement.id` instead of `statement.id`
-- `http.response.body.size` instead of `bytes_downloaded`
-- `error.type` instead of `error_code`
-
-This ensures compatibility with OTEL ecosystem.
-
-### 13.2 Statement Completion Detection
-
-**Question**: How do we know when a statement is complete for aggregation?
-
-**Options**:
-1. **Activity completion**: When statement activity stops (recommended)
-2. **Explicit marker**: Call `CompleteStatement(id)` explicitly
-3. **Timeout-based**: Emit after N seconds of inactivity
-
-**Recommendation**: Use activity completion - cleaner and automatic.
-
-### 13.3 Performance Impact on Existing Activity Users
-
-**Question**: Will adding tags impact applications that already use Activity for tracing?
-
-**Answer**: Minimal impact:
-- Tags are cheap (< 1μs to set)
-- Listener is optional (only activated when telemetry enabled)
-- Activity overhead already exists
-
-### 13.4 Feature Flag Endpoint Migration
+### 13.1 Feature Flag Endpoint Migration
 
 **Question**: When should we migrate from `OSS_JDBC` to `OSS_ADBC` endpoint?
 
@@ -5213,7 +2792,16 @@ This ensures compatibility with OTEL ecosystem.
 2. Update `TelemetryConfiguration.FeatureFlagEndpointFormat` to use `OSS_ADBC`
 3. Coordinate with server team on feature flag name (`enableTelemetryForAdbc`)
 
-**Tracking**: Create a follow-up ticket to track this migration once server-side support is ready.
+### 13.2 Context Passing in HiveServer2 Base Class
+
+**Question**: `PollForResponseAsync` lives in `HiveServer2Connection` (base class). How should `StatementTelemetryContext` be passed to it?
+
+**Options**:
+1. Add optional `StatementTelemetryContext?` parameter to `PollForResponseAsync` (clean but changes base class signature)
+2. Store context on a thread-local or `AsyncLocal<T>` (avoids signature change but implicit)
+3. Pass via the statement object which already has a reference to the connection
+
+**Recommendation**: Option 1 — explicit parameter is simplest and most testable.
 
 ---
 
@@ -5250,18 +2838,11 @@ This ensures compatibility with OTEL ecosystem.
 
 ## Summary
 
-This **Activity-based telemetry design** provides an efficient approach to collecting driver metrics by:
+This **direct object telemetry design (V3)** provides a simple approach to collecting driver metrics by:
 
-1. **Leveraging existing infrastructure**: Extends the driver's comprehensive Activity instrumentation
-2. **Single instrumentation point**: Uses Activity as the unified data model for both tracing and metrics
-3. **Standard .NET patterns**: Built on Activity/ActivityListener APIs that are platform standards
-4. **Minimal code changes**: Only requires adding tags to existing activities
-5. **Seamless integration**: Works natively with OpenTelemetry and APM tools
-
-**Key Aggregation Pattern** (following JDBC):
-- **Aggregate by `statement_id`**: Multiple activities for the same statement are aggregated together (chunk downloads, polls, etc.)
-- **Include `session_id` in exports**: Each exported event contains both `statement_id` (unique per statement) and `session_id` (shared across all statements in a connection)
-- **Enable multi-level correlation**: This allows correlation at both statement level ("show me all activities for statement X") and session level ("show me all statements for connection Y")
-- **Reference implementation**: See JDBC `TelemetryCollector.java` which uses `ConcurrentHashMap<String, StatementTelemetryDetails>` for per-statement aggregation while including session_id in exported `TelemetryEvent` objects
-
-This design enables the Databricks ADBC driver to collect valuable usage metrics while maintaining code simplicity, high performance, and full compatibility with the .NET observability ecosystem.
+1. **Direct population**: `StatementTelemetryContext` is populated inline — no Activity tags, no listeners, no aggregators
+2. **Protocol-agnostic**: Same telemetry context works for both Thrift and SEA backends
+3. **Shared base**: `DatabricksStatement` provides `CreateTelemetryContext`, `EmitTelemetry`, `RecordError` — protocol subclasses just call them
+4. **Deterministic emission**: Exactly one telemetry event per statement — on reader dispose (success) or catch block (error)
+5. **Flush-before-close**: Connection dispose blocks until all pending telemetry is sent to Databricks
+6. **JDBC-compatible**: snake_case JSON field names, same proto schema, same export endpoint

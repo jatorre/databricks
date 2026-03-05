@@ -209,9 +209,13 @@ namespace AdbcDrivers.Databricks.Telemetry
             // Route based on operation name
             string operationName = activity.OperationName ?? string.Empty;
 
+            Debug.WriteLine($"[TELEMETRY] MergeFrom: operationName={operationName}, statementId={StatementId}, duration={activity.Duration.TotalMilliseconds}ms");
+
             if (operationName.Contains("ExecuteQuery") || operationName.Contains("ExecuteUpdate") || operationName.Contains("ExecuteStatement"))
             {
+                Debug.WriteLine($"[TELEMETRY] MergeFromExecuteActivity matched for: {operationName}");
                 MergeFromExecuteActivity(activity);
+                Debug.WriteLine($"[TELEMETRY] After MergeFromExecuteActivity: StatementType={StatementTypeValue}, TotalLatencyMs={TotalLatencyMs}, ResultFormat={ResultFormat}");
             }
             else if (operationName.Contains("DownloadFiles") || operationName.Contains("CloudFetch"))
             {
@@ -557,6 +561,8 @@ namespace AdbcDrivers.Databricks.Telemetry
         /// <returns>A fully populated proto message ready for export.</returns>
         public OssSqlDriverTelemetryLog BuildTelemetryLog()
         {
+            Debug.WriteLine($"[TELEMETRY] BuildTelemetryLog: SessionId={SessionId}, StatementId={StatementId}, AuthType={AuthType}, TotalLatencyMs={TotalLatencyMs}, StatementType={StatementTypeValue}, ResultFormat={ResultFormat}, CompressionEnabled={CompressionEnabled}");
+
             OssSqlDriverTelemetryLog log = new OssSqlDriverTelemetryLog
             {
                 SessionId = SessionId ?? string.Empty,

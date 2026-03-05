@@ -62,6 +62,7 @@ namespace AdbcDrivers.Databricks.Telemetry
 
         // Session-level configuration injected into each new StatementTelemetryContext
         private string? _sessionId;
+        private string? _authType;
         private long _workspaceId;
         private DriverSystemConfiguration? _systemConfiguration;
         private DriverConnectionParameters? _connectionParams;
@@ -94,16 +95,19 @@ namespace AdbcDrivers.Databricks.Telemetry
         /// <param name="workspaceId">The Databricks workspace ID.</param>
         /// <param name="systemConfig">The driver system configuration.</param>
         /// <param name="connectionParams">The driver connection parameters.</param>
+        /// <param name="authType">The authentication type string.</param>
         public void SetSessionContext(
             string sessionId,
             long workspaceId,
             DriverSystemConfiguration? systemConfig,
-            DriverConnectionParameters? connectionParams)
+            DriverConnectionParameters? connectionParams,
+            string? authType = null)
         {
             _sessionId = sessionId;
             _workspaceId = workspaceId;
             _systemConfiguration = systemConfig;
             _connectionParams = connectionParams;
+            _authType = authType;
         }
 
         /// <summary>
@@ -235,6 +239,7 @@ namespace AdbcDrivers.Databricks.Telemetry
             {
                 StatementId = statementId,
                 SessionId = _sessionId,
+                AuthType = _authType,
                 SystemConfiguration = _systemConfiguration,
                 DriverConnectionParams = _connectionParams
             };

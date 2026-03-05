@@ -950,14 +950,23 @@ namespace AdbcDrivers.Databricks
             activity.SetTag(ConnectionOpenEvent.CharSetEncoding, Encoding.Default.WebName);
             activity.SetTag(ConnectionOpenEvent.ProcessName, Process.GetCurrentProcess().ProcessName);
 
-            // Connection parameter tags
+            // Connection parameter tags (fallback to URI if individual properties not set)
             Properties.TryGetValue(SparkParameters.Path, out string? httpPath);
-            activity.SetTag(ConnectionOpenEvent.ConnectionHttpPath, httpPath ?? string.Empty);
-
             Properties.TryGetValue(SparkParameters.HostName, out string? host);
-            activity.SetTag(ConnectionOpenEvent.ConnectionHost, host ?? string.Empty);
-
             Properties.TryGetValue(SparkParameters.Port, out string? port);
+
+            if (string.IsNullOrEmpty(host) && Properties.TryGetValue(AdbcOptions.Uri, out string? connUri) && !string.IsNullOrEmpty(connUri))
+            {
+                if (Uri.TryCreate(connUri, UriKind.Absolute, out Uri? parsedUri))
+                {
+                    host = parsedUri.Host;
+                    if (string.IsNullOrEmpty(httpPath)) httpPath = parsedUri.AbsolutePath;
+                    if (string.IsNullOrEmpty(port) && parsedUri.Port > 0) port = parsedUri.Port.ToString();
+                }
+            }
+
+            activity.SetTag(ConnectionOpenEvent.ConnectionHttpPath, httpPath ?? string.Empty);
+            activity.SetTag(ConnectionOpenEvent.ConnectionHost, host ?? string.Empty);
             activity.SetTag(ConnectionOpenEvent.ConnectionPort, port ?? "443");
 
             Properties.TryGetValue(DatabricksParameters.Protocol, out string? protocol);
@@ -1035,6 +1044,23 @@ namespace AdbcDrivers.Databricks
             Properties.TryGetValue(HttpProxyOptions.UseProxy, out string? useProxy);
             Properties.TryGetValue(ApacheParameters.BatchSize, out string? batchSizeStr);
             Properties.TryGetValue(ApacheParameters.PollTimeMilliseconds, out string? pollIntervalStr);
+
+            // Fallback to URI if individual host/path/port not set
+            if (string.IsNullOrEmpty(host) && Properties.TryGetValue(AdbcOptions.Uri, out string? uri) && !string.IsNullOrEmpty(uri))
+            {
+                if (Uri.TryCreate(uri, UriKind.Absolute, out Uri? parsedUri))
+                {
+                    host = parsedUri.Host;
+                    if (string.IsNullOrEmpty(httpPath))
+                    {
+                        httpPath = parsedUri.AbsolutePath;
+                    }
+                    if (string.IsNullOrEmpty(port) && parsedUri.Port > 0)
+                    {
+                        port = parsedUri.Port.ToString();
+                    }
+                }
+            }
 
             int portValue = (port != null && int.TryParse(port, out int parsedPort)) ? parsedPort : 443;
             long batchSizeValue = (batchSizeStr != null && long.TryParse(batchSizeStr, out long parsedBatchSize))
@@ -1146,7 +1172,8 @@ namespace AdbcDrivers.Databricks
                 {
                     DriverSystemConfiguration systemConfig = BuildSystemConfiguration();
                     DriverConnectionParameters connectionParams = BuildConnectionParameters();
-                    _metricsAggregator.SetSessionContext(sessionId, 0, systemConfig, connectionParams);
+                    string authType = DetermineAuthType();
+                    _metricsAggregator.SetSessionContext(sessionId, 0, systemConfig, connectionParams, authType);
                 }
 
                 // Step 6: Register aggregator with the global DatabricksActivityListener

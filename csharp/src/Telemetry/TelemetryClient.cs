@@ -31,7 +31,7 @@ namespace AdbcDrivers.Databricks.Telemetry
     /// <remarks>
     /// <para>
     /// This client orchestrates the complete telemetry pipeline:
-    /// DatabricksActivityListener → MetricsAggregator → CircuitBreakerTelemetryExporter → DatabricksTelemetryExporter
+    /// CircuitBreakerTelemetryExporter → DatabricksTelemetryExporter
     /// </para>
     /// <para>
     /// Key Behaviors:
@@ -54,8 +54,6 @@ namespace AdbcDrivers.Databricks.Telemetry
         private readonly DatabricksTelemetryExporter _databricksExporter;
         private readonly CircuitBreakerTelemetryExporter _circuitBreakerExporter;
         private readonly ITelemetryExporter _effectiveExporter;
-        private readonly MetricsAggregator _metricsAggregator;
-        private readonly DatabricksActivityListener _activityListener;
         private readonly ConcurrentQueue<TelemetryFrontendLog> _pendingLogs;
         private readonly int _batchSize;
         private readonly CancellationTokenSource _cts;
@@ -109,15 +107,6 @@ namespace AdbcDrivers.Databricks.Telemetry
                 // Use override exporter if provided (for testing), otherwise use circuit breaker exporter
                 _effectiveExporter = exporterOverride ?? (ITelemetryExporter)_circuitBreakerExporter;
 
-                // 3. MetricsAggregator (aggregates activities and exports via the effective exporter)
-                _metricsAggregator = new MetricsAggregator(
-                    _effectiveExporter,
-                    batchSize: configuration.BatchSize,
-                    flushInterval: TimeSpan.FromMilliseconds(configuration.FlushIntervalMs));
-
-                // 4. DatabricksActivityListener (listens to activities and delegates to aggregator)
-                _activityListener = new DatabricksActivityListener(_metricsAggregator, configuration);
-
                 Activity.Current?.AddEvent(new ActivityEvent("telemetry.client.initialized",
                     tags: new ActivityTagsCollection
                     {
@@ -132,8 +121,6 @@ namespace AdbcDrivers.Databricks.Telemetry
                 // Clean up any partially initialized resources
                 try
                 {
-                    _activityListener?.Dispose();
-                    _metricsAggregator?.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(1));
                     _cts?.Dispose();
                 }
                 catch
@@ -158,10 +145,6 @@ namespace AdbcDrivers.Databricks.Telemetry
         /// </summary>
         /// <param name="log">The telemetry frontend log to enqueue.</param>
         /// <remarks>
-        /// <para>
-        /// This method delegates to the MetricsAggregator, which handles batching and export.
-        /// The aggregator processes activities from the ActivityListener automatically.
-        /// </para>
         /// <para>
         /// This method never throws exceptions. If the client is closed or disposing,
         /// the event is silently dropped.
@@ -233,9 +216,6 @@ namespace AdbcDrivers.Databricks.Telemetry
                     await _effectiveExporter.ExportAsync(logsToFlush, ct).ConfigureAwait(false);
                 }
 
-                // Also delegate to aggregator to flush any Activity-based pending metrics
-                await _metricsAggregator.FlushAsync(ct).ConfigureAwait(false);
-
                 Activity.Current?.AddEvent(new ActivityEvent("telemetry.client.flush_completed"));
             }
             catch (Exception ex)
@@ -261,10 +241,8 @@ namespace AdbcDrivers.Databricks.Telemetry
         /// </para>
         /// <para>
         /// The close operation performs the following steps:
-        /// 1. Stop the activity listener (no more activities will be processed)
-        /// 2. Flush all remaining queued metrics from the aggregator
-        /// 3. Cancel any pending background tasks
-        /// 4. Dispose all resources (listener, aggregator, cancellation token source)
+        /// 1. Cancel any pending background tasks
+        /// 2. Dispose all resources (cancellation token source)
         /// </para>
         /// <para>
         /// This method is idempotent - calling it multiple times is safe and has no effect
@@ -275,11 +253,11 @@ namespace AdbcDrivers.Databricks.Telemetry
         /// logged internally.
         /// </para>
         /// </remarks>
-        public async Task CloseAsync()
+        public Task CloseAsync()
         {
             if (_disposed)
             {
-                return;
+                return Task.CompletedTask;
             }
 
             _disposed = true;
@@ -288,37 +266,7 @@ namespace AdbcDrivers.Databricks.Telemetry
             {
                 Activity.Current?.AddEvent(new ActivityEvent("telemetry.client.closing"));
 
-                // Step 1: Stop the activity listener (no more activities will be captured)
-                try
-                {
-                    await _activityListener.StopAsync(_cts.Token).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    Activity.Current?.AddEvent(new ActivityEvent("telemetry.client.listener_stop_error",
-                        tags: new ActivityTagsCollection
-                        {
-                            { "error.message", ex.Message },
-                            { "error.type", ex.GetType().Name }
-                        }));
-                }
-
-                // Step 2: Flush all remaining metrics from the aggregator
-                try
-                {
-                    await _metricsAggregator.FlushAsync(CancellationToken.None).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    Activity.Current?.AddEvent(new ActivityEvent("telemetry.client.final_flush_error",
-                        tags: new ActivityTagsCollection
-                        {
-                            { "error.message", ex.Message },
-                            { "error.type", ex.GetType().Name }
-                        }));
-                }
-
-                // Step 3: Cancel any pending background tasks
+                // Cancel any pending background tasks
                 try
                 {
                     _cts.Cancel();
@@ -326,21 +274,6 @@ namespace AdbcDrivers.Databricks.Telemetry
                 catch (Exception ex)
                 {
                     Activity.Current?.AddEvent(new ActivityEvent("telemetry.client.cancellation_error",
-                        tags: new ActivityTagsCollection
-                        {
-                            { "error.message", ex.Message },
-                            { "error.type", ex.GetType().Name }
-                        }));
-                }
-
-                // Step 4: Dispose all resources
-                try
-                {
-                    await _metricsAggregator.DisposeAsync().ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    Activity.Current?.AddEvent(new ActivityEvent("telemetry.client.aggregator_dispose_error",
                         tags: new ActivityTagsCollection
                         {
                             { "error.message", ex.Message },
@@ -372,6 +305,8 @@ namespace AdbcDrivers.Databricks.Telemetry
                     // Swallow CTS dispose exceptions
                 }
             }
+
+            return Task.CompletedTask;
         }
 
         /// <summary>

@@ -180,6 +180,17 @@ namespace AdbcDrivers.Databricks.StatementExecution
                 case ApacheParameters.QueryTimeoutSeconds:
                     break;
 
+                // DatabricksStatement-specific options: accept but ignore for now.
+                // SEA handles these differently (e.g., query_tags uses a JSON array in the
+                // executestatement request body instead of confOverlay). Full support will
+                // be added in a follow-up PR.
+                case DatabricksParameters.QueryTags:
+                case DatabricksParameters.UseCloudFetch:
+                case DatabricksParameters.CanDecompressLz4:
+                case DatabricksParameters.MaxBytesPerFile:
+                case DatabricksParameters.MaxBytesPerFetchRequest:
+                    break;
+
                 default:
                     base.SetOption(key, value);
                     break;

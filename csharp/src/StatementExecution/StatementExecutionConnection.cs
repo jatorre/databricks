@@ -426,7 +426,7 @@ namespace AdbcDrivers.Databricks.StatementExecution
 
                 var values = new Dictionary<AdbcInfoCode, object>
                 {
-                    { AdbcInfoCode.DriverName, "ADBC Databricks Driver" },
+                    { AdbcInfoCode.DriverName, DatabricksConnection.DatabricksDriverName },
                     { AdbcInfoCode.DriverVersion, AssemblyVersion },
                     { AdbcInfoCode.DriverArrowVersion, "1.0.0" },
                     { AdbcInfoCode.VendorName, "Databricks" },
@@ -639,7 +639,8 @@ namespace AdbcDrivers.Databricks.StatementExecution
                             tableInfo, colName, colType, position, nullable);
 
                         // Match Thrift GetObjects behavior: SparkConnection.SetPrecisionScaleAndTypeName
-                        // sets Precision/Scale to null for non-DECIMAL/CHAR types in the nested path.
+                        // only sets Precision/Scale for DECIMAL, NUMERIC, CHAR, NCHAR, VARCHAR,
+                        // NVARCHAR, LONGVARCHAR, LONGNVARCHAR. All other types get null.
                         int lastIdx = tableInfo.Precision.Count - 1;
                         short typeCode = tableInfo.ColType[lastIdx];
                         if (typeCode != (short)HiveServer2Connection.ColumnTypeId.DECIMAL

@@ -60,7 +60,9 @@ namespace AdbcDrivers.Databricks.Tests.E2E.StatementExecution
             var parsed = JsonDocument.Parse(json);
             _config = new Dictionary<string, string>();
             foreach (var prop in parsed.RootElement.EnumerateObject())
-                _config[prop.Name] = prop.Value.GetString() ?? "";
+                _config[prop.Name] = prop.Value.ValueKind == JsonValueKind.String
+                    ? prop.Value.GetString() ?? ""
+                    : prop.Value.GetRawText();
             _canRun = true;
         }
 

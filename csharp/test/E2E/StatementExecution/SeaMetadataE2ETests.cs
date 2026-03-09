@@ -21,7 +21,6 @@ using Apache.Arrow;
 using Apache.Arrow.Adbc;
 using Apache.Arrow.Adbc.Tests;
 using AdbcDrivers.HiveServer2;
-using AdbcDrivers.HiveServer2.Spark;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -50,9 +49,7 @@ namespace AdbcDrivers.Databricks.Tests.E2E.StatementExecution
 
         private AdbcConnection CreateThriftConnection()
         {
-            var parameters = GetDriverParameters();
-            parameters[SparkParameters.Type] = SparkServerTypeConstants.Http;
-            parameters[SparkParameters.AuthType] = SparkAuthTypeConstants.Token;
+            var parameters = GetDriverParameters(TestConfiguration);
             parameters[DatabricksParameters.Protocol] = "thrift";
             var driver = new DatabricksDriver();
             var db = driver.Open(parameters);
@@ -61,39 +58,11 @@ namespace AdbcDrivers.Databricks.Tests.E2E.StatementExecution
 
         private AdbcConnection CreateSeaConnection()
         {
-            var parameters = GetDriverParameters();
+            var parameters = GetDriverParameters(TestConfiguration);
             parameters[DatabricksParameters.Protocol] = "rest";
             var driver = new DatabricksDriver();
             var db = driver.Open(parameters);
             return db.Connect(new Dictionary<string, string>());
-        }
-
-        private Dictionary<string, string> GetDriverParameters()
-        {
-            var parameters = new Dictionary<string, string>();
-
-            if (!string.IsNullOrEmpty(TestConfiguration.Uri))
-                parameters[AdbcOptions.Uri] = TestConfiguration.Uri;
-            if (!string.IsNullOrEmpty(TestConfiguration.HostName))
-                parameters[SparkParameters.HostName] = TestConfiguration.HostName;
-            if (!string.IsNullOrEmpty(TestConfiguration.Path))
-                parameters[SparkParameters.Path] = TestConfiguration.Path;
-            if (!string.IsNullOrEmpty(TestConfiguration.Token))
-                parameters[SparkParameters.Token] = TestConfiguration.Token;
-            if (!string.IsNullOrEmpty(TestConfiguration.AccessToken))
-                parameters[SparkParameters.AccessToken] = TestConfiguration.AccessToken;
-            if (!string.IsNullOrEmpty(TestConfiguration.AuthType))
-                parameters[SparkParameters.AuthType] = TestConfiguration.AuthType;
-            if (!string.IsNullOrEmpty(TestConfiguration.OAuthGrantType))
-                parameters[DatabricksParameters.OAuthGrantType] = TestConfiguration.OAuthGrantType;
-            if (!string.IsNullOrEmpty(TestConfiguration.OAuthClientId))
-                parameters[DatabricksParameters.OAuthClientId] = TestConfiguration.OAuthClientId;
-            if (!string.IsNullOrEmpty(TestConfiguration.OAuthClientSecret))
-                parameters[DatabricksParameters.OAuthClientSecret] = TestConfiguration.OAuthClientSecret;
-            if (!string.IsNullOrEmpty(TestConfiguration.OAuthScope))
-                parameters[DatabricksParameters.OAuthScope] = TestConfiguration.OAuthScope;
-
-            return parameters;
         }
 
         private async Task<List<Dictionary<string, string>>> ReadMetadata(AdbcConnection connection, string command,

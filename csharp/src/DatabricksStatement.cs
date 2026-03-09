@@ -393,7 +393,7 @@ namespace AdbcDrivers.Databricks
                     activity?.AddEvent("statement.get_catalogs.complete");
 
                     // Return the result without making an RPC call
-                    return new QueryResult(1, new HiveServer2Connection.HiveInfoArrowStream(schema, new[] { array }));
+                    return new QueryResult(1, new HiveInfoArrowStream(schema, new[] { array }));
                 }
 
                 // If EnableMultipleCatalogSupport is true, delegate to base class implementation
@@ -449,7 +449,7 @@ namespace AdbcDrivers.Databricks
                     activity?.AddEvent("statement.get_schemas.complete");
 
                     // Return empty result
-                    return new QueryResult(0, new HiveServer2Connection.HiveInfoArrowStream(schema, new[] { catalogArray, schemaArray }));
+                    return new QueryResult(0, new HiveInfoArrowStream(schema, new[] { catalogArray, schemaArray }));
                 }
 
                 // Call the base implementation with the potentially modified catalog name
@@ -527,7 +527,7 @@ namespace AdbcDrivers.Databricks
                     activity?.AddEvent("statement.get_tables.complete");
 
                     // Return empty result
-                    return new QueryResult(0, new HiveServer2Connection.HiveInfoArrowStream(schema, arrays));
+                    return new QueryResult(0, new HiveInfoArrowStream(schema, arrays));
                 }
 
                 // Call the base implementation with the potentially modified catalog name
@@ -580,7 +580,7 @@ namespace AdbcDrivers.Databricks
                     activity?.AddEvent("statement.get_columns.complete");
 
                     // Return empty result
-                    return new QueryResult(0, new HiveServer2Connection.HiveInfoArrowStream(schema, arrays));
+                    return new QueryResult(0, new HiveInfoArrowStream(schema, arrays));
                 }
 
                 // Call the base implementation with the potentially modified catalog name
@@ -681,7 +681,7 @@ namespace AdbcDrivers.Databricks
                 new StringArray.Builder().Build()  // PK_NAME
             };
 
-            return new QueryResult(0, new HiveServer2Connection.HiveInfoArrowStream(schema, arrays));
+            return new QueryResult(0, new HiveInfoArrowStream(schema, arrays));
         }
 
         protected override async Task<QueryResult> GetCrossReferenceAsync(CancellationToken cancellationToken = default)
@@ -781,7 +781,7 @@ namespace AdbcDrivers.Databricks
                 new Int32Array.Builder().Build()   // DEFERRABILITY
             };
 
-            return new QueryResult(0, new HiveServer2Connection.HiveInfoArrowStream(schema, arrays));
+            return new QueryResult(0, new HiveInfoArrowStream(schema, arrays));
         }
 
         protected override async Task<QueryResult> GetColumnsExtendedAsync(CancellationToken cancellationToken = default)
@@ -1140,7 +1140,7 @@ namespace AdbcDrivers.Databricks
                 fkColumnKeySeqBuilder.Build()
             };
 
-            return new QueryResult(descResult.Columns.Count, new HiveServer2Connection.HiveInfoArrowStream(combinedSchema, combinedData));
+            return new QueryResult(descResult.Columns.Count, new HiveInfoArrowStream(combinedSchema, combinedData));
         }
     }
 }

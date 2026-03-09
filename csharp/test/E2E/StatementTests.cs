@@ -515,7 +515,6 @@ namespace AdbcDrivers.Databricks.Tests
             Assert.True(hasPkKeySeq, "Schema should contain PK_KEY_SEQ field from GetPrimaryKeys");
             Assert.True(hasFkTableName, "Schema should contain FK_PKTABLE_NAME field from GetCrossReference");
 
-            // Define the expected schema as (name, type) pairs
             var expectedSchema = new (string Name, string Type)[]
             {
                 ("TABLE_CAT", "Apache.Arrow.Types.StringType"),

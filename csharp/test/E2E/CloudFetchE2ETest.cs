@@ -27,6 +27,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Threading.Tasks;
 using Apache.Arrow;
+using AdbcDrivers.Databricks.Telemetry;
 using Apache.Arrow.Adbc;
 using Apache.Arrow.Adbc.Tests;
 using Xunit;
@@ -157,6 +158,7 @@ namespace AdbcDrivers.Databricks.Tests
                 [DatabricksParameters.CanDecompressLz4] = "true",
                 [DatabricksParameters.MaxBytesPerFile] = "10485760", // 10MB
                 [DatabricksParameters.CloudFetchUrlExpirationBufferSeconds] = (15 * 60 - 2).ToString(),
+                [TelemetryConfiguration.PropertyKeyEnabled] = "true",
             };
 
             // For REST API, configure result disposition based on CloudFetch setting

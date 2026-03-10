@@ -98,6 +98,11 @@ namespace AdbcDrivers.Databricks.StatementExecution
 
         private const string SessionsEndpoint = "/api/2.0/sql/sessions";
         private const string StatementsEndpoint = "/api/2.0/sql/statements";
+        private const string PreviewSessionsEndpoint = "/2.0/preview/sql/sessions";
+        private const string PreviewStatementsEndpoint = "/2.0/preview/sql/statements";
+
+        private readonly string _sessionsEndpoint;
+        private readonly string _statementsEndpoint;
 
         // JSON serialization options - ignore null values when writing
         private static readonly JsonSerializerOptions s_jsonOptions = new JsonSerializerOptions
@@ -110,7 +115,8 @@ namespace AdbcDrivers.Databricks.StatementExecution
         /// </summary>
         /// <param name="httpClient">The HTTP client to use for requests.</param>
         /// <param name="host">The Databricks workspace host.</param>
-        public StatementExecutionClient(HttpClient httpClient, string host)
+        /// <param name="usePreviewEndpoint">When true, uses /2.0/sql/... paths instead of /api/2.0/sql/... paths.</param>
+        public StatementExecutionClient(HttpClient httpClient, string host, bool usePreviewEndpoint = false)
         {
             _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
 
@@ -127,6 +133,8 @@ namespace AdbcDrivers.Databricks.StatementExecution
             }
 
             _baseUrl = host;
+            _sessionsEndpoint = usePreviewEndpoint ? PreviewSessionsEndpoint : SessionsEndpoint;
+            _statementsEndpoint = usePreviewEndpoint ? PreviewStatementsEndpoint : StatementsEndpoint;
         }
 
         /// <summary>
@@ -144,7 +152,7 @@ namespace AdbcDrivers.Databricks.StatementExecution
                 throw new ArgumentNullException(nameof(request));
             }
 
-            var url = $"{_baseUrl}{SessionsEndpoint}";
+            var url = $"{_baseUrl}{_sessionsEndpoint}";
             var jsonContent = JsonSerializer.Serialize(request, s_jsonOptions);
             var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
 
@@ -188,7 +196,7 @@ namespace AdbcDrivers.Databricks.StatementExecution
             }
 
             // Databricks requires warehouse_id as query parameter even for DELETE
-            var url = $"{_baseUrl}{SessionsEndpoint}/{sessionId}?warehouse_id={Uri.EscapeDataString(warehouseId)}";
+            var url = $"{_baseUrl}{_sessionsEndpoint}/{sessionId}?warehouse_id={Uri.EscapeDataString(warehouseId)}";
             var httpRequest = new HttpRequestMessage(HttpMethod.Delete, url);
 
             var response = await _httpClient.SendAsync(httpRequest, cancellationToken).ConfigureAwait(false);
@@ -211,7 +219,7 @@ namespace AdbcDrivers.Databricks.StatementExecution
                 throw new ArgumentNullException(nameof(request));
             }
 
-            var url = $"{_baseUrl}{StatementsEndpoint}";
+            var url = $"{_baseUrl}{_statementsEndpoint}";
             var jsonContent = JsonSerializer.Serialize(request, s_jsonOptions);
             var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
 
@@ -266,7 +274,7 @@ namespace AdbcDrivers.Databricks.StatementExecution
                 throw new ArgumentException("Statement ID cannot be null or whitespace.", nameof(statementId));
             }
 
-            var url = $"{_baseUrl}{StatementsEndpoint}/{statementId}";
+            var url = $"{_baseUrl}{_statementsEndpoint}/{statementId}";
             var httpRequest = new HttpRequestMessage(HttpMethod.Get, url);
 
             var response = await _httpClient.SendAsync(httpRequest, cancellationToken).ConfigureAwait(false);
@@ -306,7 +314,7 @@ namespace AdbcDrivers.Databricks.StatementExecution
                 throw new ArgumentException("Chunk index must be non-negative.", nameof(chunkIndex));
             }
 
-            var url = $"{_baseUrl}{StatementsEndpoint}/{statementId}/result/chunks/{chunkIndex}";
+            var url = $"{_baseUrl}{_statementsEndpoint}/{statementId}/result/chunks/{chunkIndex}";
             var httpRequest = new HttpRequestMessage(HttpMethod.Get, url);
 
             var response = await _httpClient.SendAsync(httpRequest, cancellationToken).ConfigureAwait(false);
@@ -337,7 +345,7 @@ namespace AdbcDrivers.Databricks.StatementExecution
                 throw new ArgumentException("Statement ID cannot be null or whitespace.", nameof(statementId));
             }
 
-            var url = $"{_baseUrl}{StatementsEndpoint}/{statementId}/cancel";
+            var url = $"{_baseUrl}{_statementsEndpoint}/{statementId}/cancel";
             var httpRequest = new HttpRequestMessage(HttpMethod.Post, url);
 
             var response = await _httpClient.SendAsync(httpRequest, cancellationToken).ConfigureAwait(false);
@@ -360,7 +368,7 @@ namespace AdbcDrivers.Databricks.StatementExecution
             }
 
             // Databricks uses DELETE on /statements/{statement_id}, not POST to /close
-            var url = $"{_baseUrl}{StatementsEndpoint}/{statementId}";
+            var url = $"{_baseUrl}{_statementsEndpoint}/{statementId}";
             var httpRequest = new HttpRequestMessage(HttpMethod.Delete, url);
 
             var response = await _httpClient.SendAsync(httpRequest, cancellationToken).ConfigureAwait(false);

@@ -30,6 +30,7 @@ on:
       - 'ci/scripts/**'
       - 'csharp/src/**'
       - 'csharp/test/**'
+  merge_group:
 
 concurrency:
   group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
@@ -38,7 +39,9 @@ concurrency:
 jobs:
   run-all-tests:
     runs-on: ubuntu-latest
-    environment: azure-prod
+    # merge_group has direct access to repo secrets — no approval gate needed.
+    # pull_request and push use the azure-prod environment which requires manual approval.
+    environment: ${{ github.event_name != 'merge_group' && 'azure-prod' || '' }}
     env:
       DATABRICKS_SERVER_HOSTNAME: ${{ secrets.DATABRICKS_HOST }}
       DATABRICKS_HTTP_PATH: ${{ secrets.TEST_PECO_WAREHOUSE_HTTP_PATH }}

@@ -518,14 +518,48 @@ impl adbc_core::Database for Database {
         let auth_provider: Arc<dyn AuthProvider> = match auth_type {
             AuthType::AccessToken => Arc::new(PersonalAccessToken::new(
                 access_token
-                    .expect("access_token should be validated above")
+                    .ok_or_else(|| {
+                        DatabricksErrorHelper::invalid_argument()
+                            .message(
+                                "databricks.access_token is required for auth type 'access_token'",
+                            )
+                            .to_adbc()
+                    })?
                     .clone(),
             )),
             AuthType::OAuthM2m => {
-                // Client credentials flow not yet implemented
-                return Err(DatabricksErrorHelper::invalid_state()
-                    .message("Client credentials flow (M2M) not yet implemented")
-                    .to_adbc());
+                // Client credentials flow (M2M) - create ClientCredentialsProvider
+                let client_id = self.auth_config.client_id.as_ref().ok_or_else(|| {
+                    DatabricksErrorHelper::invalid_argument()
+                        .message("databricks.auth.client_id is required for auth type 'oauth_m2m'")
+                        .to_adbc()
+                })?;
+                let client_secret = self.auth_config.client_secret.as_ref().ok_or_else(|| {
+                    DatabricksErrorHelper::invalid_argument()
+                        .message(
+                            "databricks.auth.client_secret is required for auth type 'oauth_m2m'",
+                        )
+                        .to_adbc()
+                })?;
+
+                // Default scope for M2M is "all-apis" (no offline_access since M2M has no refresh token)
+                let scopes_str = self.auth_config.scopes.as_deref().unwrap_or("all-apis");
+                let scopes: Vec<String> = scopes_str.split_whitespace().map(String::from).collect();
+
+                let provider = runtime
+                    .block_on(
+                        crate::auth::ClientCredentialsProvider::new_with_full_config(
+                            host,
+                            client_id,
+                            client_secret,
+                            http_client.clone(),
+                            scopes,
+                            self.auth_config.token_endpoint.clone(),
+                        ),
+                    )
+                    .map_err(|e| e.to_adbc())?;
+
+                Arc::new(provider)
             }
             AuthType::OAuthU2m => {
                 // U2M flow - create AuthorizationCodeProvider
@@ -1238,5 +1272,92 @@ mod tests {
         let result = config.validate(&None);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), AuthType::OAuthU2m);
+    }
+
+    #[test]
+    fn test_database_m2m_config_validation() {
+        let mut db = Database::new();
+        db.set_option(
+            OptionDatabase::Other("databricks.auth.type".into()),
+            OptionValue::String("oauth_m2m".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other("databricks.auth.client_id".into()),
+            OptionValue::String("test-client-id".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other("databricks.auth.client_secret".into()),
+            OptionValue::String("test-secret".into()),
+        )
+        .unwrap();
+
+        assert_eq!(db.auth_config.auth_type, Some(AuthType::OAuthM2m));
+        assert_eq!(db.auth_config.client_id, Some("test-client-id".to_string()));
+        assert_eq!(
+            db.auth_config.client_secret,
+            Some("test-secret".to_string())
+        );
+    }
+
+    #[test]
+    fn test_database_m2m_config_with_custom_scopes() {
+        let mut db = Database::new();
+        db.set_option(
+            OptionDatabase::Other("databricks.auth.type".into()),
+            OptionValue::String("oauth_m2m".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other("databricks.auth.client_id".into()),
+            OptionValue::String("test-client-id".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other("databricks.auth.client_secret".into()),
+            OptionValue::String("test-secret".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other("databricks.auth.scopes".into()),
+            OptionValue::String("custom-scope-1 custom-scope-2".into()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.auth_config.scopes,
+            Some("custom-scope-1 custom-scope-2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_database_m2m_config_with_token_endpoint_override() {
+        let mut db = Database::new();
+        db.set_option(
+            OptionDatabase::Other("databricks.auth.type".into()),
+            OptionValue::String("oauth_m2m".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other("databricks.auth.client_id".into()),
+            OptionValue::String("test-client-id".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other("databricks.auth.client_secret".into()),
+            OptionValue::String("test-secret".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other("databricks.auth.token_endpoint".into()),
+            OptionValue::String("https://custom.endpoint/token".into()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.auth_config.token_endpoint,
+            Some("https://custom.endpoint/token".to_string())
+        );
     }
 }

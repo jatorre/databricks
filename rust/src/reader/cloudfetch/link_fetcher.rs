@@ -666,6 +666,29 @@ mod tests {
                 .await
         }
 
+        async fn list_procedures(
+            &self,
+            _session_id: &str,
+            _catalog: Option<&str>,
+            _schema_pattern: Option<&str>,
+            _procedure_pattern: Option<&str>,
+        ) -> Result<ExecuteResult> {
+            self.execute_statement("", "", &ExecuteParams::default())
+                .await
+        }
+
+        async fn list_procedure_columns(
+            &self,
+            _session_id: &str,
+            _catalog: Option<&str>,
+            _schema_pattern: Option<&str>,
+            _procedure_pattern: Option<&str>,
+            _column_pattern: Option<&str>,
+        ) -> Result<ExecuteResult> {
+            self.execute_statement("", "", &ExecuteParams::default())
+                .await
+        }
+
         fn list_table_types(&self) -> Vec<String> {
             vec!["TABLE".to_string()]
         }

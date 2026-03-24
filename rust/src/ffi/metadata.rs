@@ -397,6 +397,121 @@ pub unsafe extern "C" fn metadata_get_foreign_keys(
     .unwrap_or_else(handle_panic)
 }
 
+/// List procedures matching the given filter criteria.
+///
+/// Uses `information_schema.routines` filtered by `routine_type = 'PROCEDURE'`.
+/// When catalog is NULL, queries `system.information_schema` (cross-catalog).
+/// When catalog is empty string, returns an empty result set.
+///
+/// # Safety
+///
+/// - `conn` must be a valid pointer to a `Connection`
+/// - String arguments may be null (treated as no filter)
+/// - `out` must point to a valid, writable `FFI_ArrowArrayStream`
+#[no_mangle]
+pub unsafe extern "C" fn metadata_get_procedures(
+    conn: *const c_void,
+    catalog: *const c_char,
+    schema_pattern: *const c_char,
+    procedure_pattern: *const c_char,
+    out: *mut FFI_ArrowArrayStream,
+) -> FfiStatus {
+    clear_last_error();
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let conn = get_connection!(conn);
+        let Ok(catalog) = (unsafe { c_str_to_option(catalog) }) else {
+            return FfiStatus::Error;
+        };
+        let Ok(schema_pattern) = (unsafe { c_str_to_option(schema_pattern) }) else {
+            return FfiStatus::Error;
+        };
+        let Ok(procedure_pattern) = (unsafe { c_str_to_option(procedure_pattern) }) else {
+            return FfiStatus::Error;
+        };
+
+        // Empty catalog → return empty result (no server round-trip).
+        // ODBC layer constructs proper schema for the empty result set.
+        if catalog == Some("") {
+            let reader: Box<dyn ResultReader + Send> =
+                Box::new(EmptyReader::new(Arc::new(Schema::empty())));
+            return export_reader(reader, None, out);
+        }
+
+        match conn
+            .runtime_handle()
+            .block_on(conn.client().list_procedures(
+                conn.session_id(),
+                catalog,
+                schema_pattern,
+                procedure_pattern,
+            )) {
+            Ok(result) => export_reader(result.reader, result.manifest.as_ref(), out),
+            Err(e) => set_error_from_result(&e),
+        }
+    }))
+    .unwrap_or_else(handle_panic)
+}
+
+/// List procedure columns (parameters) matching the given filter criteria.
+///
+/// Uses `information_schema.parameters` joined with `information_schema.routines`.
+/// When catalog is NULL, queries `system.information_schema` (cross-catalog).
+/// When catalog is empty string, returns empty result with correct column schema.
+///
+/// # Safety
+///
+/// - `conn` must be a valid pointer to a `Connection`
+/// - String arguments may be null (treated as no filter)
+/// - `out` must point to a valid, writable `FFI_ArrowArrayStream`
+#[no_mangle]
+pub unsafe extern "C" fn metadata_get_procedure_columns(
+    conn: *const c_void,
+    catalog: *const c_char,
+    schema_pattern: *const c_char,
+    procedure_pattern: *const c_char,
+    column_pattern: *const c_char,
+    out: *mut FFI_ArrowArrayStream,
+) -> FfiStatus {
+    clear_last_error();
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let conn = get_connection!(conn);
+        let Ok(catalog) = (unsafe { c_str_to_option(catalog) }) else {
+            return FfiStatus::Error;
+        };
+        let Ok(schema_pattern) = (unsafe { c_str_to_option(schema_pattern) }) else {
+            return FfiStatus::Error;
+        };
+        let Ok(procedure_pattern) = (unsafe { c_str_to_option(procedure_pattern) }) else {
+            return FfiStatus::Error;
+        };
+        let Ok(column_pattern) = (unsafe { c_str_to_option(column_pattern) }) else {
+            return FfiStatus::Error;
+        };
+
+        // Empty catalog → return empty result (no server round-trip).
+        // ODBC layer constructs proper schema for the empty result set.
+        if catalog == Some("") {
+            let reader: Box<dyn ResultReader + Send> =
+                Box::new(EmptyReader::new(Arc::new(Schema::empty())));
+            return export_reader(reader, None, out);
+        }
+
+        match conn
+            .runtime_handle()
+            .block_on(conn.client().list_procedure_columns(
+                conn.session_id(),
+                catalog,
+                schema_pattern,
+                procedure_pattern,
+                column_pattern,
+            )) {
+            Ok(result) => export_reader(result.reader, result.manifest.as_ref(), out),
+            Err(e) => set_error_from_result(&e),
+        }
+    }))
+    .unwrap_or_else(handle_panic)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

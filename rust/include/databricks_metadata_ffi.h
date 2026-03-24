@@ -194,6 +194,52 @@ FfiStatus metadata_get_foreign_keys(
     struct ArrowArrayStream* out
 );
 
+/**
+ * List procedures matching the given filter criteria.
+ *
+ * Queries information_schema.routines filtered by routine_type = 'PROCEDURE'.
+ * When catalog is NULL, queries system.information_schema (cross-catalog).
+ * When catalog is empty string, returns an empty result set.
+ *
+ * @param conn               Pointer to the Rust Connection.
+ * @param catalog            Catalog name filter (NULL = cross-catalog via system).
+ * @param schema_pattern     Schema name pattern (NULL = no filter).
+ * @param procedure_pattern  Procedure name pattern (NULL = no filter).
+ * @param[out] out           Arrow stream to populate.
+ * @return FfiStatus code.
+ */
+FfiStatus metadata_get_procedures(
+    const void* conn,
+    const char* catalog,
+    const char* schema_pattern,
+    const char* procedure_pattern,
+    struct ArrowArrayStream* out
+);
+
+/**
+ * List procedure columns (parameters) matching the given filter criteria.
+ *
+ * Queries information_schema.parameters joined with information_schema.routines.
+ * When catalog is NULL, queries system.information_schema (cross-catalog).
+ * When catalog is empty string, returns an empty result set.
+ *
+ * @param conn               Pointer to the Rust Connection.
+ * @param catalog            Catalog name filter (NULL = cross-catalog via system).
+ * @param schema_pattern     Schema name pattern (NULL = no filter).
+ * @param procedure_pattern  Procedure name pattern (NULL = no filter).
+ * @param column_pattern     Column/parameter name pattern (NULL = no filter).
+ * @param[out] out           Arrow stream to populate.
+ * @return FfiStatus code.
+ */
+FfiStatus metadata_get_procedure_columns(
+    const void* conn,
+    const char* catalog,
+    const char* schema_pattern,
+    const char* procedure_pattern,
+    const char* column_pattern,
+    struct ArrowArrayStream* out
+);
+
 #ifdef __cplusplus
 }
 #endif

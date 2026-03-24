@@ -215,6 +215,34 @@ pub trait DatabricksClient: Send + Sync + std::fmt::Debug {
         column_pattern: Option<&str>,
     ) -> Result<ExecuteResult>;
 
+    /// List procedures, optionally filtered by catalog, schema pattern, and procedure name pattern.
+    ///
+    /// Uses `information_schema.routines` filtered by `routine_type = 'PROCEDURE'`.
+    /// When catalog is None, queries `system.information_schema.routines` (cross-catalog).
+    /// When catalog is empty string, returns empty result.
+    async fn list_procedures(
+        &self,
+        session_id: &str,
+        catalog: Option<&str>,
+        schema_pattern: Option<&str>,
+        procedure_pattern: Option<&str>,
+    ) -> Result<ExecuteResult>;
+
+    /// List procedure columns (parameters), optionally filtered.
+    ///
+    /// Uses `information_schema.parameters` joined with `information_schema.routines`
+    /// filtered by `routine_type = 'PROCEDURE'`.
+    /// When catalog is None, queries `system.information_schema` (cross-catalog).
+    /// When catalog is empty string, returns empty result.
+    async fn list_procedure_columns(
+        &self,
+        session_id: &str,
+        catalog: Option<&str>,
+        schema_pattern: Option<&str>,
+        procedure_pattern: Option<&str>,
+        column_pattern: Option<&str>,
+    ) -> Result<ExecuteResult>;
+
     /// List supported table types (static, no SQL executed).
     fn list_table_types(&self) -> Vec<String>;
 }

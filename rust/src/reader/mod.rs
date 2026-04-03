@@ -33,8 +33,10 @@ use crate::reader::inline::InlineArrowProvider;
 use crate::types::cloudfetch::{CloudFetchConfig, CloudFetchLink};
 use crate::types::sea::{CompressionCodec, ResultManifest, StatementState};
 use arrow_array::RecordBatch;
+use arrow_array::{Array, StructArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use driverbase::error::ErrorHelper;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use cloudfetch::StreamingCloudFetchProvider as CloudFetchReader;
@@ -394,35 +396,199 @@ pub mod metadata_keys {
 }
 
 /// Adapter to make ResultReader work as arrow's RecordBatchReader.
+///
+/// When `use_geoarrow` is enabled, detects Databricks geometry columns
+/// (`Struct<srid: Int32, wkb: Binary>`) and converts them to standard
+/// GeoArrow `geoarrow.wkb` extension type (Binary with Arrow extension
+/// metadata). This enables zero-copy geometry passthrough to DuckDB,
+/// pandas/geopandas, polars, and other GeoArrow-aware consumers.
 pub struct ResultReaderAdapter {
     inner: Box<dyn ResultReader + Send>,
     schema: SchemaRef,
+    /// Column indices that are Databricks geometry structs to be converted.
+    geo_columns: Vec<usize>,
+    /// Whether CRS metadata has been captured from the first batch's SRIDs.
+    schema_finalized: bool,
 }
 
 impl ResultReaderAdapter {
     /// Create a new adapter wrapping a ResultReader, optionally augmenting the
-    /// schema with Databricks column metadata from the SEA manifest.
+    /// schema with Databricks column metadata from the SEA manifest and
+    /// converting geometry structs to GeoArrow.
     pub fn new(
         inner: Box<dyn ResultReader + Send>,
         manifest: Option<&ResultManifest>,
+        use_geoarrow: bool,
     ) -> Result<Self> {
         let schema = inner.schema()?;
         let schema = match manifest {
             Some(m) => Self::augment_schema_with_manifest(&schema, m),
             None => schema,
         };
-        Ok(Self { inner, schema })
+
+        // Detect geometry columns if geoarrow conversion is enabled
+        let geo_columns = if use_geoarrow {
+            Self::detect_geometry_columns(&schema)
+        } else {
+            vec![]
+        };
+
+        // Rewrite schema: replace geometry Struct fields with Binary + geoarrow metadata
+        let schema = if !geo_columns.is_empty() {
+            Self::build_geoarrow_schema(&schema, &geo_columns)
+        } else {
+            schema
+        };
+
+        let schema_finalized = geo_columns.is_empty();
+        Ok(Self {
+            inner,
+            schema,
+            geo_columns,
+            schema_finalized,
+        })
+    }
+
+    /// Detect columns that match the Databricks geometry struct pattern:
+    /// `Struct<srid: Int32, wkb: Binary>`
+    fn detect_geometry_columns(schema: &SchemaRef) -> Vec<usize> {
+        schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, field)| {
+                if Self::is_geometry_struct(field.data_type()) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Check if a DataType matches Databricks' geometry struct:
+    /// `Struct<srid: Int32, wkb: Binary>`
+    fn is_geometry_struct(dt: &DataType) -> bool {
+        if let DataType::Struct(fields) = dt {
+            if fields.len() == 2 {
+                let has_srid = fields
+                    .iter()
+                    .any(|f| f.name() == "srid" && f.data_type() == &DataType::Int32);
+                let has_wkb = fields
+                    .iter()
+                    .any(|f| f.name() == "wkb" && f.data_type() == &DataType::Binary);
+                return has_srid && has_wkb;
+            }
+        }
+        false
+    }
+
+    /// Build a GeoArrow-compatible schema by replacing geometry struct fields
+    /// with Binary fields annotated with `ARROW:extension:name=geoarrow.wkb`.
+    ///
+    /// CRS metadata is added later from the first batch's SRID values.
+    fn build_geoarrow_schema(schema: &SchemaRef, geo_columns: &[usize]) -> SchemaRef {
+        let new_fields: Vec<Field> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, field)| {
+                if geo_columns.contains(&i) {
+                    let mut metadata = field.metadata().clone();
+                    metadata.insert(
+                        "ARROW:extension:name".to_string(),
+                        "geoarrow.wkb".to_string(),
+                    );
+                    Field::new(field.name(), DataType::Binary, field.is_nullable())
+                        .with_metadata(metadata)
+                } else {
+                    field.as_ref().clone()
+                }
+            })
+            .collect();
+
+        Arc::new(Schema::new_with_metadata(
+            new_fields,
+            schema.metadata().clone(),
+        ))
+    }
+
+    /// Update the schema with CRS metadata from the first batch's SRID values.
+    /// Reads the srid field from each geometry struct column and encodes it as
+    /// PROJJSON in `ARROW:extension:metadata`.
+    fn finalize_schema_with_crs(&mut self, batch: &RecordBatch) {
+        let mut new_fields: Vec<Field> = self.schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+
+        for &col_idx in &self.geo_columns {
+            // The original batch still has the struct column
+            let col = batch.column(col_idx);
+            if let Some(struct_array) = col.as_any().downcast_ref::<StructArray>() {
+                if let Some(srid_array) = struct_array.column_by_name("srid") {
+                    if let Some(srid_arr) = srid_array.as_any().downcast_ref::<arrow_array::Int32Array>() {
+                        // Read SRID from first non-null row
+                        let srid = (0..srid_arr.len())
+                            .find(|&i| !srid_arr.is_null(i))
+                            .map(|i| srid_arr.value(i))
+                            .unwrap_or(0);
+
+                        if srid != 0 {
+                            let crs_json = Self::srid_to_projjson(srid);
+                            let mut metadata = new_fields[col_idx].metadata().clone();
+                            metadata.insert(
+                                "ARROW:extension:metadata".to_string(),
+                                format!("{{\"crs\":{}}}", crs_json),
+                            );
+                            new_fields[col_idx] = new_fields[col_idx].clone().with_metadata(metadata);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.schema = Arc::new(Schema::new_with_metadata(
+            new_fields,
+            self.schema.metadata().clone(),
+        ));
+        self.schema_finalized = true;
+    }
+
+    /// Convert an SRID to a PROJJSON CRS string.
+    fn srid_to_projjson(srid: i32) -> String {
+        let name = match srid {
+            4326 => "WGS 84",
+            3857 => "WGS 84 / Pseudo-Mercator",
+            _ => "Unknown",
+        };
+        format!(
+            "{{\"type\":\"ProjectedCRS\",\"name\":\"{name}\",\"id\":{{\"authority\":\"EPSG\",\"code\":{srid}}}}}",
+            name = name,
+            srid = srid,
+        )
+    }
+
+    /// Transform a RecordBatch: extract `wkb` child array from geometry struct
+    /// columns. This is zero-copy — it just takes a reference to the child array.
+    fn transform_batch_for_geoarrow(&self, batch: RecordBatch) -> RecordBatch {
+        if self.geo_columns.is_empty() {
+            return batch;
+        }
+
+        let mut columns: Vec<Arc<dyn Array>> = batch.columns().to_vec();
+
+        for &col_idx in &self.geo_columns {
+            let col = &columns[col_idx];
+            if let Some(struct_array) = col.as_any().downcast_ref::<StructArray>() {
+                if let Some(wkb_array) = struct_array.column_by_name("wkb") {
+                    columns[col_idx] = wkb_array.clone();
+                }
+            }
+        }
+
+        RecordBatch::try_new(self.schema.clone(), columns).unwrap_or(batch)
     }
 
     /// Augment an Arrow schema with Databricks column metadata from the manifest.
-    ///
-    /// For each field in the schema, if a matching ColumnInfo exists (by position),
-    /// attach `databricks.*` key-value metadata to the field. This preserves
-    /// server-provided type_name, type_text, precision, scale, etc. through the
-    /// Arrow C Data Interface FFI boundary.
     fn augment_schema_with_manifest(schema: &SchemaRef, manifest: &ResultManifest) -> SchemaRef {
-        use std::collections::HashMap;
-
         let col_by_pos: HashMap<usize, &crate::types::sea::ColumnInfo> = manifest
             .schema
             .columns
@@ -485,7 +651,17 @@ impl Iterator for ResultReaderAdapter {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.inner.next_batch() {
-            Ok(Some(batch)) => Some(Ok(batch)),
+            Ok(Some(batch)) => {
+                if !self.geo_columns.is_empty() {
+                    // On first batch, capture SRID for CRS metadata
+                    if !self.schema_finalized {
+                        self.finalize_schema_with_crs(&batch);
+                    }
+                    Some(Ok(self.transform_batch_for_geoarrow(batch)))
+                } else {
+                    Some(Ok(batch))
+                }
+            }
             Ok(None) => None,
             Err(e) => Some(Err(ArrowError::ExternalError(Box::new(
                 std::io::Error::other(e.to_string()),
@@ -512,7 +688,7 @@ mod tests {
     fn test_adapter_schema() {
         let batch = make_test_batch(vec!["a"]);
         let reader: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
-        let adapter = ResultReaderAdapter::new(reader, None).unwrap();
+        let adapter = ResultReaderAdapter::new(reader, None, false).unwrap();
         let schema = arrow_array::RecordBatchReader::schema(&adapter);
         assert_eq!(schema.fields().len(), 1);
         assert_eq!(schema.field(0).name(), "name");
@@ -523,7 +699,7 @@ mod tests {
         let batch1 = make_test_batch(vec!["a", "b"]);
         let batch2 = make_test_batch(vec!["c"]);
         let reader: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch1, batch2]));
-        let mut adapter = ResultReaderAdapter::new(reader, None).unwrap();
+        let mut adapter = ResultReaderAdapter::new(reader, None, false).unwrap();
 
         let first = adapter.next().unwrap().unwrap();
         assert_eq!(first.num_rows(), 2);
@@ -537,7 +713,7 @@ mod tests {
     #[test]
     fn test_adapter_empty_reader() {
         let reader: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![]));
-        let mut adapter = ResultReaderAdapter::new(reader, None).unwrap();
+        let mut adapter = ResultReaderAdapter::new(reader, None, false).unwrap();
         assert!(adapter.next().is_none());
     }
 
@@ -545,7 +721,7 @@ mod tests {
     fn test_adapter_propagates_error() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, false)]));
         let reader: Box<dyn ResultReader + Send> = Box::new(ErrorReader { schema });
-        let mut adapter = ResultReaderAdapter::new(reader, None).unwrap();
+        let mut adapter = ResultReaderAdapter::new(reader, None, false).unwrap();
 
         let result = adapter.next().unwrap();
         assert!(result.is_err());
@@ -554,7 +730,7 @@ mod tests {
     #[test]
     fn test_adapter_schema_error() {
         let reader: Box<dyn ResultReader + Send> = Box::new(SchemaErrorReader);
-        let result = ResultReaderAdapter::new(reader, None);
+        let result = ResultReaderAdapter::new(reader, None, false);
         assert!(result.is_err());
     }
 
@@ -814,7 +990,7 @@ mod tests {
             "name", "STRING", "STRING", 0, None, None, None,
         )]);
 
-        let adapter = ResultReaderAdapter::new(reader, Some(&manifest)).unwrap();
+        let adapter = ResultReaderAdapter::new(reader, Some(&manifest), false).unwrap();
         let schema = arrow_array::RecordBatchReader::schema(&adapter);
         assert_eq!(
             schema.field(0).metadata().get(metadata_keys::TYPE_NAME),
@@ -827,7 +1003,7 @@ mod tests {
         let batch = make_test_batch(vec!["hello"]);
         let reader: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
 
-        let adapter = ResultReaderAdapter::new(reader, None).unwrap();
+        let adapter = ResultReaderAdapter::new(reader, None, false).unwrap();
         let schema = arrow_array::RecordBatchReader::schema(&adapter);
         // No databricks metadata when manifest is None
         assert!(!schema

@@ -44,6 +44,8 @@ pub struct Statement {
     runtime_handle: RuntimeHandle,
     /// Current statement ID (set after execution).
     current_statement_id: Option<String>,
+    /// Convert Databricks geometry structs to geoarrow.wkb.
+    use_arrow_native_geospatial: bool,
 }
 
 impl Statement {
@@ -52,6 +54,7 @@ impl Statement {
         client: Arc<dyn DatabricksClient>,
         session_id: String,
         runtime_handle: RuntimeHandle,
+        use_arrow_native_geospatial: bool,
     ) -> Self {
         Self {
             query: None,
@@ -59,6 +62,7 @@ impl Statement {
             session_id,
             runtime_handle,
             current_statement_id: None,
+            use_arrow_native_geospatial,
         }
     }
 
@@ -105,9 +109,15 @@ impl adbc_core::Statement for Statement {
     }
 
     fn prepare(&mut self) -> Result<()> {
-        Err(DatabricksErrorHelper::not_implemented()
-            .message("prepare")
-            .to_adbc())
+        // Databricks doesn't have server-side prepared statements, but
+        // ADBC consumers (e.g. DuckDB's adbc_scanner) call prepare before
+        // execute. Accept it as a no-op if a query has been set.
+        if self.query.is_none() {
+            return Err(DatabricksErrorHelper::invalid_state()
+                .message("No query set before prepare")
+                .to_adbc());
+        }
+        Ok(())
     }
 
     fn get_parameter_schema(&self) -> Result<Schema> {
@@ -151,7 +161,12 @@ impl adbc_core::Statement for Statement {
         self.current_statement_id = Some(result.statement_id);
 
         // Wrap in adapter for RecordBatchReader trait
-        ResultReaderAdapter::new(result.reader, result.manifest.as_ref()).map_err(|e| e.to_adbc())
+        ResultReaderAdapter::new(
+            result.reader,
+            result.manifest.as_ref(),
+            self.use_arrow_native_geospatial,
+        )
+        .map_err(|e| e.to_adbc())
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {

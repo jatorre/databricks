@@ -28,6 +28,7 @@ use adbc_core::error::Result;
 use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
 use adbc_core::Optionable;
 use driverbase::error::ErrorHelper;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,6 +58,9 @@ pub struct Database {
 
     // Authentication configuration
     auth_config: AuthConfig,
+
+    // Arrow serialization options
+    use_arrow_native_geospatial: bool,
 }
 
 impl Database {
@@ -421,6 +425,16 @@ impl Optionable for Database {
                     }
                 }
 
+                // Arrow serialization options
+                "databricks.arrow.native_geospatial" => {
+                    if let Some(v) = Self::parse_bool_option(&value) {
+                        self.use_arrow_native_geospatial = v;
+                        Ok(())
+                    } else {
+                        Err(DatabricksErrorHelper::set_invalid_option(&key, &value).to_adbc())
+                    }
+                }
+
                 _ => Err(DatabricksErrorHelper::set_unknown_option(&key).to_adbc()),
             },
             _ => Err(DatabricksErrorHelper::set_unknown_option(&key).to_adbc()),
@@ -752,6 +766,13 @@ impl adbc_core::Database for Database {
         );
         sea_client.set_reader_factory(reader_factory, runtime.handle().clone());
 
+        // Build session configuration
+        let mut session_config = HashMap::new();
+        if self.use_arrow_native_geospatial {
+            session_config
+                .insert("arrow_native_geospatial".to_string(), "true".to_string());
+        }
+
         // Create connection (passes runtime ownership to Connection)
         Connection::new_with_runtime(
             ConnectionConfig {
@@ -760,6 +781,8 @@ impl adbc_core::Database for Database {
                 catalog: self.catalog.clone(),
                 schema: self.schema.clone(),
                 client,
+                session_config,
+                use_arrow_native_geospatial: self.use_arrow_native_geospatial,
             },
             runtime,
         )

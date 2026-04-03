@@ -50,6 +50,8 @@ pub struct ResultReaderFactory {
     http_client: Arc<DatabricksHttpClient>,
     config: CloudFetchConfig,
     runtime_handle: tokio::runtime::Handle,
+    /// Keeps the runtime alive as long as any reader exists.
+    _runtime_keepalive: Arc<tokio::runtime::Runtime>,
 }
 
 impl ResultReaderFactory {
@@ -58,13 +60,14 @@ impl ResultReaderFactory {
         client: Arc<dyn DatabricksClient>,
         http_client: Arc<DatabricksHttpClient>,
         config: CloudFetchConfig,
-        runtime_handle: tokio::runtime::Handle,
+        runtime: Arc<tokio::runtime::Runtime>,
     ) -> Self {
         Self {
             client,
             http_client,
             config,
-            runtime_handle,
+            runtime_handle: runtime.handle().clone(),
+            _runtime_keepalive: runtime,
         }
     }
 
@@ -266,7 +269,7 @@ impl ResultReaderFactory {
 
         Ok(Box::new(CloudFetchResultReader::new(
             provider,
-            self.runtime_handle.clone(),
+            self._runtime_keepalive.clone(),
         )))
     }
 
@@ -300,16 +303,21 @@ pub trait ResultReader: Send {
 struct CloudFetchResultReader {
     provider: Arc<StreamingCloudFetchProvider>,
     runtime_handle: tokio::runtime::Handle,
+    /// Prevents the tokio Runtime from being dropped while this reader is alive.
+    /// The reader crosses the FFI boundary (lives inside FFI_ArrowArrayStream)
+    /// and may outlive the ADBC Connection that owns the Runtime.
+    _runtime_keepalive: Arc<tokio::runtime::Runtime>,
 }
 
 impl CloudFetchResultReader {
     fn new(
         provider: Arc<StreamingCloudFetchProvider>,
-        runtime_handle: tokio::runtime::Handle,
+        runtime: Arc<tokio::runtime::Runtime>,
     ) -> Self {
         Self {
             provider,
-            runtime_handle,
+            runtime_handle: runtime.handle().clone(),
+            _runtime_keepalive: runtime,
         }
     }
 }

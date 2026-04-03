@@ -25,7 +25,6 @@ use arrow_array::RecordBatchReader;
 use arrow_schema::Schema;
 use driverbase::error::ErrorHelper;
 use std::sync::Arc;
-use tokio::runtime::Handle as RuntimeHandle;
 use tracing::debug;
 
 /// Represents a SQL statement that can be executed against Databricks.
@@ -40,8 +39,8 @@ pub struct Statement {
     client: Arc<dyn DatabricksClient>,
     /// Session ID for this statement's connection.
     session_id: String,
-    /// Tokio runtime handle for async operations.
-    runtime_handle: RuntimeHandle,
+    /// Tokio runtime for async operations (Arc keeps it alive while stream is open).
+    runtime: Arc<tokio::runtime::Runtime>,
     /// Current statement ID (set after execution).
     current_statement_id: Option<String>,
 }
@@ -51,13 +50,13 @@ impl Statement {
     pub(crate) fn new(
         client: Arc<dyn DatabricksClient>,
         session_id: String,
-        runtime_handle: RuntimeHandle,
+        runtime: Arc<tokio::runtime::Runtime>,
     ) -> Self {
         Self {
             query: None,
             client,
             session_id,
-            runtime_handle,
+            runtime,
             current_statement_id: None,
         }
     }
@@ -139,7 +138,7 @@ impl adbc_core::Statement for Statement {
 
         // Execute statement via DatabricksClient (handles polling and reader creation)
         let result = self
-            .runtime_handle
+            .runtime
             .block_on(self.client.execute_statement(
                 &self.session_id,
                 query,
@@ -184,7 +183,7 @@ impl adbc_core::Statement for Statement {
     fn cancel(&mut self) -> Result<()> {
         if let Some(ref statement_id) = self.current_statement_id {
             debug!("Canceling statement: {}", statement_id);
-            self.runtime_handle
+            self.runtime
                 .block_on(self.client.cancel_statement(statement_id))
                 .map_err(|e| e.to_adbc())?;
         }
@@ -197,7 +196,7 @@ impl Drop for Statement {
         // Clean up statement resources
         if let Some(ref statement_id) = self.current_statement_id {
             let _ = self
-                .runtime_handle
+                .runtime
                 .block_on(self.client.close_statement(statement_id));
         }
     }

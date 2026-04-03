@@ -63,8 +63,8 @@ pub struct Connection {
     // Session ID (created on connection initialization)
     session_id: String,
 
-    // Tokio runtime for async operations
-    runtime: tokio::runtime::Runtime,
+    // Tokio runtime for async operations (Arc so readers can keep it alive)
+    runtime: Arc<tokio::runtime::Runtime>,
 
     // Tracing span that attaches session_id to all log lines within this connection
     _log_span: EnteredSpan,
@@ -82,7 +82,7 @@ impl Connection {
     /// SeaClient and ResultReaderFactory before Connection is created.
     pub(crate) fn new_with_runtime(
         config: ConnectionConfig,
-        runtime: tokio::runtime::Runtime,
+        runtime: Arc<tokio::runtime::Runtime>,
     ) -> crate::error::Result<Self> {
         // Enter the ADBC span before any work so all log lines are tagged.
         // session_id is recorded once the session is created.
@@ -136,8 +136,8 @@ impl Connection {
 
     /// Returns the tokio runtime handle.
     #[cfg(feature = "metadata-ffi")]
-    pub(crate) fn runtime_handle(&self) -> &tokio::runtime::Handle {
-        self.runtime.handle()
+    pub(crate) fn runtime_handle(&self) -> tokio::runtime::Handle {
+        self.runtime.handle().clone()
     }
 }
 
@@ -179,7 +179,7 @@ impl adbc_core::Connection for Connection {
         Ok(Statement::new(
             self.client.clone(),
             self.session_id.clone(),
-            self.runtime.handle().clone(),
+            self.runtime.clone(),
         ))
     }
 

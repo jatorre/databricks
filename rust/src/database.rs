@@ -399,12 +399,12 @@ impl adbc_core::Database for Database {
                 .map_err(|e| e.to_adbc())?,
         );
 
-        // Create tokio runtime for async operations
-        let runtime = tokio::runtime::Runtime::new().map_err(|e| {
+        // Create tokio runtime for async operations (Arc-wrapped so readers can keep it alive)
+        let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
             DatabricksErrorHelper::io()
                 .message(format!("Failed to create async runtime: {}", e))
                 .to_adbc()
-        })?;
+        })?);
 
         // Two-step initialization required because ResultReaderFactory needs
         // Arc<dyn DatabricksClient>, which requires wrapping SeaClient in Arc first.
@@ -429,7 +429,7 @@ impl adbc_core::Database for Database {
             client.clone(),
             http_client,
             self.cloudfetch_config.clone(),
-            runtime.handle().clone(),
+            runtime.clone(),
         );
         sea_client.set_reader_factory(reader_factory, runtime.handle().clone());
 

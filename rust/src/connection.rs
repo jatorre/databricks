@@ -44,6 +44,7 @@ pub struct ConnectionConfig {
     pub catalog: Option<String>,
     pub schema: Option<String>,
     pub client: Arc<dyn DatabricksClient>,
+    pub session_config: HashMap<String, String>,
 }
 
 /// Represents an active connection to a Databricks SQL endpoint.
@@ -98,7 +99,7 @@ impl Connection {
         let session_info = runtime.block_on(config.client.create_session(
             config.catalog.as_deref(),
             config.schema.as_deref(),
-            HashMap::new(),
+            config.session_config,
         ))?;
 
         Span::current().record("session_id", session_info.session_id.as_str());

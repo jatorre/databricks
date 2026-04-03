@@ -80,3 +80,10 @@ metadata-ffi = ["ffi", "dep:arrow"]
 [lib]
 name = "databricks_adbc"
 crate-type = ["lib", "cdylib", "staticlib"]
+
+# Patch adbc_ffi to fix double-free in release_ffi_error.
+# The upstream release function doesn't null pointers after freeing,
+# causing a double-free when DuckDB's driver manager calls release
+# and then the error struct is cleaned up again.
+[patch.crates-io]
+adbc_ffi = { path = "patches/adbc_ffi" }

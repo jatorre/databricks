@@ -52,10 +52,18 @@ namespace AdbcDrivers.Databricks
         public const string MaxBytesPerFile = "adbc.databricks.cloudfetch.max_bytes_per_file";
 
         /// <summary>
-        /// Maximum number of retry attempts for CloudFetch downloads.
-        /// Default value is 3 if not specified.
+        /// Maximum number of retry attempts for CloudFetch downloads (total attempts, including first try).
+        /// Default value is 0 (no limit, use timeout only).
+        /// When set to a positive value, the retry loop exits if either this count or the timeout is reached.
         /// </summary>
         public const string CloudFetchMaxRetries = "adbc.databricks.cloudfetch.max_retries";
+
+        /// <summary>
+        /// Maximum time in seconds to retry failed CloudFetch downloads.
+        /// Uses exponential backoff with jitter within this time budget.
+        /// Default value is 300 (5 minutes) if not specified.
+        /// </summary>
+        public const string CloudFetchRetryTimeoutSeconds = "adbc.databricks.cloudfetch.retry_timeout_seconds";
 
         /// <summary>
         /// Delay in milliseconds between CloudFetch retry attempts.
@@ -134,6 +142,21 @@ namespace AdbcDrivers.Databricks
         /// Default value is 120 seconds. Set to 0 to retry indefinitely.
         /// </summary>
         public const string RateLimitRetryTimeout = "adbc.databricks.rate_limit_retry_timeout";
+
+        /// <summary>
+        /// Controls whether to retry requests that fail due to transport-level errors
+        /// (connection refused, TCP reset, DNS failure, dead connections).
+        /// Default value is true (enabled). Set to false to disable transport error retry behavior.
+        /// </summary>
+        public const string TransportErrorRetry = "adbc.databricks.transport_error_retry";
+
+        /// <summary>
+        /// Per-request timeout in seconds to detect dead connections (e.g., half-open TCP).
+        /// When a connection hangs without sending data, this timeout fires to cancel the request
+        /// and allow retry. Default value is 900 seconds (15 minutes), matching JDBC socketTimeout.
+        /// Set to 0 to disable the per-request timeout.
+        /// </summary>
+        public const string HttpRequestTimeout = "adbc.databricks.http_request_timeout";
 
         /// <summary>
         /// Maximum number of parallel downloads for CloudFetch operations.
@@ -360,7 +383,7 @@ namespace AdbcDrivers.Databricks
         /// <summary>
         /// Whether to enable the feature flag cache for fetching remote configuration from the server.
         /// When enabled, the driver fetches feature flags from the Databricks server and merges them with local properties.
-        /// Default value is true if not specified.
+        /// Default value is false if not specified.
         /// </summary>
         public const string FeatureFlagCacheEnabled = "adbc.databricks.feature_flag_cache_enabled";
 
@@ -422,9 +445,18 @@ namespace AdbcDrivers.Databricks
         public const int DefaultRateLimitRetryTimeout = 120; // 2 minutes
 
         /// <summary>
-        /// Default timeout in minutes for CloudFetch HTTP operations.
+        /// Default per-request timeout in seconds to detect dead connections.
+        /// Matches JDBC driver's socketTimeout=900.
         /// </summary>
-        public const int DefaultCloudFetchTimeoutMinutes = 5;
+        public const int DefaultHttpRequestTimeout = 900; // 15 minutes
+
+        /// <summary>
+        /// Default timeout in minutes for CloudFetch HTTP operations.
+        /// Covers both HttpClient.Timeout (SendAsync/headers) and body read timeout.
+        /// Set to 15 minutes because ReadAsByteArrayAsync is a separate call from SendAsync
+        /// and HttpClient.Timeout does not protect body reads when ResponseHeadersRead is used.
+        /// </summary>
+        public const int DefaultCloudFetchTimeoutMinutes = 15;
 
         /// <summary>
         /// OAuth grant type constants

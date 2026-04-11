@@ -20,6 +20,7 @@
 //! - `SeaClient`: Implementation using the Statement Execution API (REST)
 
 pub mod http;
+pub mod retry;
 pub mod sea;
 
 use crate::error::Result;
@@ -30,7 +31,10 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::time::Duration;
 
-pub use http::{DatabricksHttpClient, HttpClientConfig};
+pub use http::{DatabricksHttpClient, HttpClientConfig, ProxyConfig};
+pub use retry::{
+    build_retry_configs, RequestCategory, RequestType, RetryConfig, RetryConfigOverrides,
+};
 pub use sea::SeaClient;
 
 /// Backend-agnostic configuration for DatabricksClient implementations.
@@ -62,11 +66,12 @@ pub struct SessionInfo {
     pub session_id: String,
 }
 
-/// Result from `execute_statement`. Contains the statement ID (for cancellation/cleanup)
-/// and a reader over the result data.
+/// Result from `execute_statement`. Contains the statement ID (for cancellation/cleanup),
+/// a reader over the result data, and optionally the SEA manifest for metadata propagation.
 pub struct ExecuteResult {
     pub statement_id: String,
     pub reader: Box<dyn ResultReader + Send>,
+    pub manifest: Option<ResultManifest>,
 }
 
 impl std::fmt::Debug for ExecuteResult {
@@ -74,6 +79,7 @@ impl std::fmt::Debug for ExecuteResult {
         f.debug_struct("ExecuteResult")
             .field("statement_id", &self.statement_id)
             .field("reader", &"<dyn ResultReader>")
+            .field("manifest", &self.manifest)
             .finish()
     }
 }
@@ -210,6 +216,34 @@ pub trait DatabricksClient: Send + Sync + std::fmt::Debug {
         catalog: &str,
         schema_pattern: Option<&str>,
         table_pattern: Option<&str>,
+        column_pattern: Option<&str>,
+    ) -> Result<ExecuteResult>;
+
+    /// List procedures, optionally filtered by catalog, schema pattern, and procedure name pattern.
+    ///
+    /// Uses `information_schema.routines` filtered by `routine_type = 'PROCEDURE'`.
+    /// When catalog is None, queries `system.information_schema.routines` (cross-catalog).
+    /// When catalog is empty string, returns empty result.
+    async fn list_procedures(
+        &self,
+        session_id: &str,
+        catalog: Option<&str>,
+        schema_pattern: Option<&str>,
+        procedure_pattern: Option<&str>,
+    ) -> Result<ExecuteResult>;
+
+    /// List procedure columns (parameters), optionally filtered.
+    ///
+    /// Uses `information_schema.parameters` joined with `information_schema.routines`
+    /// filtered by `routine_type = 'PROCEDURE'`.
+    /// When catalog is None, queries `system.information_schema` (cross-catalog).
+    /// When catalog is empty string, returns empty result.
+    async fn list_procedure_columns(
+        &self,
+        session_id: &str,
+        catalog: Option<&str>,
+        schema_pattern: Option<&str>,
+        procedure_pattern: Option<&str>,
         column_pattern: Option<&str>,
     ) -> Result<ExecuteResult>;
 

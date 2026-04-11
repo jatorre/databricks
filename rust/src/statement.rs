@@ -160,7 +160,7 @@ impl adbc_core::Statement for Statement {
         self.current_statement_id = Some(result.statement_id);
 
         // Wrap in adapter for RecordBatchReader trait
-        ResultReaderAdapter::new(result.reader, self.use_arrow_native_geospatial)
+        ResultReaderAdapter::new(result.reader, result.manifest.as_ref(), self.use_arrow_native_geospatial)
             .map_err(|e| e.to_adbc())
     }
 

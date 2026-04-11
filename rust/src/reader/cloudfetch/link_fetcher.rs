@@ -588,6 +588,7 @@ mod tests {
             Ok(ExecuteResult {
                 statement_id: "mock-statement".to_string(),
                 reader: Box::new(EmptyReader::new(StdArc::new(Schema::empty()))),
+                manifest: None,
             })
         }
 
@@ -659,6 +660,29 @@ mod tests {
             _catalog: &str,
             _schema_pattern: Option<&str>,
             _table_pattern: Option<&str>,
+            _column_pattern: Option<&str>,
+        ) -> Result<ExecuteResult> {
+            self.execute_statement("", "", &ExecuteParams::default())
+                .await
+        }
+
+        async fn list_procedures(
+            &self,
+            _session_id: &str,
+            _catalog: Option<&str>,
+            _schema_pattern: Option<&str>,
+            _procedure_pattern: Option<&str>,
+        ) -> Result<ExecuteResult> {
+            self.execute_statement("", "", &ExecuteParams::default())
+                .await
+        }
+
+        async fn list_procedure_columns(
+            &self,
+            _session_id: &str,
+            _catalog: Option<&str>,
+            _schema_pattern: Option<&str>,
+            _procedure_pattern: Option<&str>,
             _column_pattern: Option<&str>,
         ) -> Result<ExecuteResult> {
             self.execute_statement("", "", &ExecuteParams::default())

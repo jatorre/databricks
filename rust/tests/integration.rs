@@ -130,15 +130,14 @@ fn test_cloudfetch_options() {
 
 #[test]
 fn test_auth_providers() {
-    use databricks_adbc::auth::{AuthProvider, OAuthCredentials, PersonalAccessToken};
+    use databricks_adbc::auth::{AuthProvider, PersonalAccessToken};
 
     // Test PAT
     let pat = PersonalAccessToken::new("test-token");
     assert_eq!(pat.get_auth_header().unwrap(), "Bearer test-token");
 
-    // Test OAuth (not yet implemented)
-    let oauth = OAuthCredentials::new("client-id", "client-secret");
-    assert!(oauth.get_auth_header().is_err());
+    // OAuth providers (ClientCredentialsProvider and AuthorizationCodeProvider)
+    // require async initialization and HTTP client, so they are tested in unit tests
 }
 
 #[test]
@@ -180,6 +179,12 @@ fn test_real_connection() {
             OptionValue::String(http_path),
         )
         .expect("Failed to set http_path");
+    database
+        .set_option(
+            OptionDatabase::Other("databricks.auth.type".into()),
+            OptionValue::String("access_token".into()),
+        )
+        .expect("Failed to set auth type");
     database
         .set_option(
             OptionDatabase::Other("databricks.access_token".into()),
